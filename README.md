@@ -8,14 +8,14 @@ A new settable inode timestamp for the Linux kernel that preserves file provenan
 
 ## The Problem
 
-Linux has no syscall to set file birth time (btime). Every file copy resets the creation date to "now." This has been an unresolved kernel limitation since 2019, where proposals to make btime settable stalled over the question of whether btime's forensic semantics should be preserved.
+Linux has no syscall to set file birth time (btime). Every file copy resets the creation date to "now." This has been an acknowledged and unresolved kernel limitation since 2019, where proposals to make btime settable stalled over the question of whether btime's forensic semantics should be preserved.
 
 An xattr-based workaround (user.provenance_time) was attempted and found **structurally unworkable**:
 
 1. **Atomic saves destroy xattrs** -- Applications save via write-to-temp + rename(), replacing the inode. All xattrs are permanently destroyed. Only the kernel sees both inodes during rename() -- no userspace wrapper, daemon, or hook can copy metadata across this boundary.
 2. **Silent opt-in failure** -- Each tool must explicitly preserve xattrs (cp needs --preserve=xattr, rsync needs -X, tar needs --xattrs). Any missing flag causes silent metadata loss. Transparent preservation through arbitrary tool flows is not achievable in userspace.
 
-These are architectural limitations of the xattr approach, not fixable implementation bugs.
+Atomic saves are the default behavior of mainstream applications (LibreOffice, Vim, Kate, etc.). These are architectural limitations of the xattr approach, not fixable implementation bugs.
 
 ## Relationship to Existing Proposals
 
@@ -196,7 +196,7 @@ Same PKGBUILD clone-and-patch approach for each tool. Patch details in tools/ di
 
 Developed using AI-assisted tooling (multi-agent framework) for implementation, iterative code review, and testing infrastructure. 5 independent review rounds identified and fixed 6 bugs before convergence. Human maintainer is responsible for review, testing, sign-off, and follow-up.
 
-Kernel 6.19.11, EndeavourOS, AMD Ryzen 9 9900X, Samsung 9100 PRO 8TB NVMe.
+Kernel 6.19.11, EndeavourOS, AMD Ryzen 9 9900X, Samsung 9100 PRO NVMe.
 
 ## Repository Structure
 
