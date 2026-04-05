@@ -1,0 +1,4 @@
+QA output created by 802
+Case 1 (no-ptime over ptime) sec: 1560608400
+Case 2 (both have ptime, source wins) sec: 1000000000
+Case 3 (neither has ptime) sec: 0

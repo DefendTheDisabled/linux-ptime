@@ -1,0 +1,49 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2026 Sean.  All Rights Reserved.
+#
+# FS QA Test No. 805
+#
+# Test ptime survives chmod.
+# Set ptime, change file permissions, verify ptime unchanged.
+#
+. ./common/preamble
+_begin_fstest auto quick ptime
+
+. ./common/ptime
+
+_require_scratch_ptime
+
+_scratch_mkfs >> $seqres.full 2>&1
+_scratch_mount
+
+testfile=$SCRATCH_MNT/ptime_chmod
+
+echo "chmod test" > $testfile
+_ptime_set $testfile 1560608400 999000000
+
+# Cycle through multiple permission changes
+chmod 600 $testfile
+sec=$(_ptime_get_sec $testfile)
+nsec=$(_ptime_get_nsec $testfile)
+echo "After chmod 600: $sec $nsec"
+
+chmod 755 $testfile
+sec=$(_ptime_get_sec $testfile)
+nsec=$(_ptime_get_nsec $testfile)
+echo "After chmod 755: $sec $nsec"
+
+chmod 644 $testfile
+sec=$(_ptime_get_sec $testfile)
+nsec=$(_ptime_get_nsec $testfile)
+echo "After chmod 644: $sec $nsec"
+
+# Also test chown (to same user, just exercises setattr path)
+chown root:root $testfile
+sec=$(_ptime_get_sec $testfile)
+nsec=$(_ptime_get_nsec $testfile)
+echo "After chown: $sec $nsec"
+
+_scratch_unmount
+status=0
+exit

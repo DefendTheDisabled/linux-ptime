@@ -1,0 +1,6 @@
+QA output created by 800
+Initial ptime sec: 0
+After set ptime sec: 1560608400
+After set ptime nsec: 123456789
+After second set ptime sec: 946684800
+After second set ptime nsec: 0

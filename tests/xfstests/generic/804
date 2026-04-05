@@ -1,0 +1,51 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2026 Sean.  All Rights Reserved.
+#
+# FS QA Test No. 804
+#
+# Test ptime with UTIME_OMIT for atime/mtime.
+# Setting ptime should not alter atime or mtime.
+#
+. ./common/preamble
+_begin_fstest auto quick ptime
+
+. ./common/ptime
+
+_require_scratch_ptime
+_require_statx
+
+_scratch_mkfs >> $seqres.full 2>&1
+_scratch_mount
+
+testfile=$SCRATCH_MNT/ptime_omit
+
+echo "utime omit test" > $testfile
+sync
+
+# Record atime and mtime before setting ptime using stat (epoch seconds)
+atime_before=$(stat -c %X $testfile)
+mtime_before=$(stat -c %Y $testfile)
+
+# Small sleep to ensure any inadvertent timestamp update would be detectable
+sleep 1
+
+# Set ptime — atime and mtime should be UTIME_OMIT
+_ptime_set $testfile 1560608400 0
+
+atime_after=$(stat -c %X $testfile)
+mtime_after=$(stat -c %Y $testfile)
+
+# Verify ptime was set
+sec=$(_ptime_get_sec $testfile)
+echo "ptime set correctly: $([ "$sec" = "1560608400" ] && echo yes || echo no)"
+
+# Verify atime unchanged
+echo "atime unchanged: $([ "$atime_before" = "$atime_after" ] && echo yes || echo no)"
+
+# Verify mtime unchanged
+echo "mtime unchanged: $([ "$mtime_before" = "$mtime_after" ] && echo yes || echo no)"
+
+_scratch_unmount
+status=0
+exit

@@ -1,0 +1,9 @@
+QA output created by 351
+--- nlink=1 rename-over ---
+nlink=1 inherit: 1560608400
+--- nlink>1 target ---
+renamed file ptime (inherited from target): 1560608400
+hardlink ptime (original inode): 1560608400
+--- RENAME_EXCHANGE ---
+After exchange fileA ptime: 2000000000
+After exchange fileB ptime: 1000000000

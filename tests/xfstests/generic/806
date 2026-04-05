@@ -1,0 +1,46 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2026 Sean.  All Rights Reserved.
+#
+# FS QA Test No. 806
+#
+# Test ptime survives truncate.
+# Set ptime, truncate file to zero, verify ptime unchanged.
+# Also test write-extending the file after truncate.
+#
+. ./common/preamble
+_begin_fstest auto quick ptime
+
+. ./common/ptime
+
+_require_scratch_ptime
+
+_scratch_mkfs >> $seqres.full 2>&1
+_scratch_mount
+
+testfile=$SCRATCH_MNT/ptime_truncate
+
+echo "some content here for truncation test" > $testfile
+_ptime_set $testfile 1560608400 500000000
+
+# Truncate to zero
+truncate -s 0 $testfile
+sec=$(_ptime_get_sec $testfile)
+nsec=$(_ptime_get_nsec $testfile)
+echo "After truncate to 0: $sec $nsec"
+
+# Write new content (in-place, same inode)
+echo "new content after truncate" > $testfile
+sec=$(_ptime_get_sec $testfile)
+nsec=$(_ptime_get_nsec $testfile)
+echo "After write to truncated file: $sec $nsec"
+
+# Truncate to a larger size (sparse)
+truncate -s 1M $testfile
+sec=$(_ptime_get_sec $testfile)
+nsec=$(_ptime_get_nsec $testfile)
+echo "After truncate to 1M: $sec $nsec"
+
+_scratch_unmount
+status=0
+exit

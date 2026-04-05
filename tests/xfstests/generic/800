@@ -1,0 +1,44 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2026 Sean.  All Rights Reserved.
+#
+# FS QA Test No. 800
+#
+# Test ptime basic set/read functionality.
+# Set ptime via utimensat(AT_UTIME_PTIME), read back via
+# statx(STATX_PTIME), verify the value matches including nanoseconds.
+#
+. ./common/preamble
+_begin_fstest auto quick ptime
+
+. ./common/ptime
+
+_require_scratch_ptime
+
+_scratch_mkfs >> $seqres.full 2>&1
+_scratch_mount
+
+testfile=$SCRATCH_MNT/ptime_basic
+
+# Create file and verify no ptime initially
+echo "hello" > $testfile
+sec=$(_ptime_get_sec $testfile)
+echo "Initial ptime sec: $sec"
+
+# Set ptime to a known value with nanoseconds
+_ptime_set $testfile 1560608400 123456789
+sec=$(_ptime_get_sec $testfile)
+nsec=$(_ptime_get_nsec $testfile)
+echo "After set ptime sec: $sec"
+echo "After set ptime nsec: $nsec"
+
+# Set to a different value to confirm it is truly settable
+_ptime_set $testfile 946684800 0
+sec=$(_ptime_get_sec $testfile)
+nsec=$(_ptime_get_nsec $testfile)
+echo "After second set ptime sec: $sec"
+echo "After second set ptime nsec: $nsec"
+
+_scratch_unmount
+status=0
+exit

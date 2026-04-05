@@ -1,0 +1,78 @@
+From bba49247cab70eb6d60d59e5110be5fff275400c Mon Sep 17 00:00:00 2001
+From: Sean Smith <DefendTheDisabled@gmail.com>
+Date: Sun, 5 Apr 2026 01:50:55 -0500
+Subject: [PATCH 5/6] fat: map ptime to FAT creation time with rename-over
+
+Map ptime to the FAT/VFAT creation time field. Only active on VFAT
+(long filename) mounts since plain FAT12/FAT16 lack creation time.
+FAT32 creation time has 2-second precision.
+
+Getattr: report creation time as ptime (VFAT only, via isvfat check).
+Setattr: write ptime to i_crtime.
+Rename-over: save target creation time before detach, restore to
+  source after attach. Preserves creation time across atomic saves.
+
+Signed-off-by: Sean Smith <DefendTheDisabled@gmail.com>
+---
+ fs/fat/file.c       |  6 ++++++
+ fs/fat/namei_vfat.c | 20 ++++++++++++++++++--
+ 2 files changed, 24 insertions(+), 2 deletions(-)
+
+diff --git a/fs/fat/file.c b/fs/fat/file.c
+index 4fc49a614..9d1fcc554 100644
+--- a/fs/fat/file.c
++++ b/fs/fat/file.c
+@@ -413,6 +413,10 @@ int fat_getattr(struct mnt_idmap *idmap, const struct path *path,
+ 		stat->result_mask |= STATX_BTIME;
+ 		stat->btime = MSDOS_I(inode)->i_crtime;
+ 	}
++	if (sbi->options.isvfat && (request_mask & STATX_PTIME)) {
++		stat->result_mask |= STATX_PTIME;
++		stat->ptime = MSDOS_I(inode)->i_crtime;
++	}
+ 
+ 	return 0;
+ }
+@@ -564,6 +568,8 @@ int fat_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
+ 		fat_truncate_time(inode, &attr->ia_mtime, S_MTIME);
+ 	attr->ia_valid &= ~(ATTR_ATIME|ATTR_CTIME|ATTR_MTIME);
+ 
++	if (attr->ia_valid & ATTR_PTIME)
++		MSDOS_I(inode)->i_crtime = attr->ia_ptime;
+ 	setattr_copy(idmap, inode, attr);
+ 	mark_inode_dirty(inode);
+ out:
+diff --git a/fs/fat/namei_vfat.c b/fs/fat/namei_vfat.c
+index 47ff083cf..f1e2eadf8 100644
+--- a/fs/fat/namei_vfat.c
++++ b/fs/fat/namei_vfat.c
+@@ -975,8 +975,24 @@ static int vfat_rename(struct inode *old_dir, struct dentry *old_dentry,
+ 	}
+ 	inode_inc_iversion(new_dir);
+ 
+-	fat_detach(old_inode);
+-	fat_attach(old_inode, new_i_pos);
++	/* ptime rename-over: save target creation time */
++	{
++		struct timespec64 saved_crtime = {};
++		bool inherit_crtime = false;
++
++		if (new_inode && S_ISREG(old_inode->i_mode) &&
++		    S_ISREG(new_inode->i_mode) && old_inode->i_nlink == 1) {
++			saved_crtime = MSDOS_I(new_inode)->i_crtime;
++			inherit_crtime = true;
++		}
++
++		fat_detach(old_inode);
++		fat_attach(old_inode, new_i_pos);
++
++		if (inherit_crtime)
++			MSDOS_I(old_inode)->i_crtime = saved_crtime;
++	}
++
+ 	err = vfat_sync_ipos(new_dir, old_inode);
+ 	if (err)
+ 		goto error_inode;
+-- 
+2.53.0
+

@@ -1,0 +1,54 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2026 Sean.  All Rights Reserved.
+#
+# FS QA Test No. 802
+#
+# Test ptime rename-over preservation (atomic save pattern).
+# Set ptime on file A, create file B (no ptime), rename B over A.
+# Verify B inherits A's ptime — this is the core atomic-save
+# survival mechanism.
+#
+. ./common/preamble
+_begin_fstest auto quick ptime
+
+. ./common/ptime
+
+_require_scratch_ptime
+
+_scratch_mkfs >> $seqres.full 2>&1
+_scratch_mount
+
+dir=$SCRATCH_MNT/rename_test
+mkdir -p $dir
+
+# Case 1: Source has no ptime, target has ptime → inherit target ptime
+echo "original" > $dir/target
+_ptime_set $dir/target 1560608400 0
+echo "new content" > $dir/source
+mv $dir/source $dir/target
+
+sec=$(_ptime_get_sec $dir/target)
+echo "Case 1 (no-ptime over ptime) sec: $sec"
+
+# Case 2: Source has ptime, target has ptime → source ptime wins
+echo "A" > $dir/fileA
+echo "B" > $dir/fileB
+_ptime_set $dir/fileA 1000000000 0
+_ptime_set $dir/fileB 2000000000 0
+mv $dir/fileA $dir/fileB
+
+sec=$(_ptime_get_sec $dir/fileB)
+echo "Case 2 (both have ptime, source wins) sec: $sec"
+
+# Case 3: Source has no ptime, target has no ptime → stays zero
+echo "X" > $dir/noA
+echo "Y" > $dir/noB
+mv $dir/noA $dir/noB
+
+sec=$(_ptime_get_sec $dir/noB)
+echo "Case 3 (neither has ptime) sec: $sec"
+
+_scratch_unmount
+status=0
+exit

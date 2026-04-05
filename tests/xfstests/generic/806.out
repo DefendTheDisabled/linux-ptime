@@ -1,0 +1,4 @@
+QA output created by 806
+After truncate to 0: 1560608400 500000000
+After write to truncated file: 1560608400 500000000
+After truncate to 1M: 1560608400 500000000

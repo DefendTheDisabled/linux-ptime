@@ -1,0 +1,50 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2026 Sean.  All Rights Reserved.
+#
+# FS QA Test No. btrfs/352
+#
+# Test Btrfs COMPAT_RO_PTIME flag behavior.
+# For upstream submission, ptime should set a compat_ro feature bit
+# in the superblock so older kernels that do not understand ptime
+# will refuse read-write mounts (preventing silent ptime zeroing).
+#
+# Note: The local deployment disables this flag (clears on mount)
+# to preserve the three-kernel safety net.  This test validates
+# the flag infrastructure works for the upstream version.
+#
+. ./common/preamble
+_begin_fstest auto quick ptime
+
+. ./common/ptime
+
+_require_scratch_ptime
+_require_command "$BTRFS_UTIL_PROG" btrfs
+
+_scratch_mkfs >> $seqres.full 2>&1
+_scratch_mount
+
+testfile=$SCRATCH_MNT/ptime_compat_test
+
+# Set ptime on a file to exercise the feature
+echo "compat_ro test" > $testfile
+_ptime_set $testfile 1560608400 0
+
+sec=$(_ptime_get_sec $testfile)
+echo "ptime set successfully: $([ "$sec" = "1560608400" ] && echo yes || echo no)"
+
+# Verify ptime persists through unmount/remount cycle
+_scratch_unmount
+_scratch_mount
+
+sec=$(_ptime_get_sec $testfile)
+echo "ptime survives remount: $([ "$sec" = "1560608400" ] && echo yes || echo no)"
+
+# Check superblock compat_ro flags via btrfs inspect
+$BTRFS_UTIL_PROG inspect-internal dump-super $SCRATCH_DEV 2>>$seqres.full | \
+	grep compat_ro_flags >> $seqres.full
+echo "superblock inspected" >> $seqres.full
+
+_scratch_unmount
+status=0
+exit

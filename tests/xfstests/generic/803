@@ -1,0 +1,49 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2026 Sean.  All Rights Reserved.
+#
+# FS QA Test No. 803
+#
+# Test ptime permissions.
+# Setting ptime should require ownership or CAP_FOWNER.
+# Non-owner attempts should fail with EPERM.
+#
+. ./common/preamble
+_begin_fstest auto quick ptime
+
+. ./common/ptime
+
+_require_scratch_ptime
+_require_root
+
+# Verify we can run commands as nobody (using -s /bin/sh for nologin shells)
+su -s /bin/sh nobody -c "id" >> $seqres.full 2>&1 || \
+	_notrun "cannot execute commands as nobody"
+
+_scratch_mkfs >> $seqres.full 2>&1
+_scratch_mount
+
+testfile=$SCRATCH_MNT/ptime_perms
+
+# Create file owned by root
+echo "owned by root" > $testfile
+chmod 666 $testfile
+_ptime_set $testfile 1560608400 0
+
+# Verify root can read ptime
+sec=$(_ptime_get_sec $testfile)
+echo "Root set ptime sec: $sec"
+
+# Non-owner (nobody) tries to set ptime — should fail with EPERM
+su -s /bin/sh nobody -c "$here/src/ptime_set $testfile 9999999 0" \
+	>> $seqres.full 2>&1
+rc=$?
+echo "Non-owner ptime_set exit code: $rc"
+
+# Verify ptime unchanged
+sec=$(_ptime_get_sec $testfile)
+echo "After non-owner attempt sec: $sec"
+
+_scratch_unmount
+status=0
+exit

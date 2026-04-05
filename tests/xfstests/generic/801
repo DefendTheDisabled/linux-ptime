@@ -1,0 +1,45 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2026 Sean.  All Rights Reserved.
+#
+# FS QA Test No. 801
+#
+# Test ptime on-disk persistence.
+# Set ptime, sync, drop caches, read back — verify it survived.
+#
+. ./common/preamble
+_begin_fstest auto quick ptime
+
+. ./common/ptime
+
+_require_scratch_ptime
+
+_scratch_mkfs >> $seqres.full 2>&1
+_scratch_mount
+
+testfile=$SCRATCH_MNT/ptime_persist
+
+echo "persist test" > $testfile
+_ptime_set $testfile 1560608400 500000000
+
+# Force to disk and drop caches
+sync
+echo 3 > /proc/sys/vm/drop_caches 2>/dev/null
+
+sec=$(_ptime_get_sec $testfile)
+nsec=$(_ptime_get_nsec $testfile)
+echo "After sync+drop sec: $sec"
+echo "After sync+drop nsec: $nsec"
+
+# Unmount and remount to verify on-disk persistence
+_scratch_unmount
+_scratch_mount
+
+sec=$(_ptime_get_sec $testfile)
+nsec=$(_ptime_get_nsec $testfile)
+echo "After remount sec: $sec"
+echo "After remount nsec: $nsec"
+
+_scratch_unmount
+status=0
+exit

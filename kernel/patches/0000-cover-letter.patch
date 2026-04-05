@@ -1,0 +1,47 @@
+From a7c981250c51e6875c439665a564c8e062369cc8 Mon Sep 17 00:00:00 2001
+From: Sean Smith <DefendTheDisabled@gmail.com>
+Date: Sun, 5 Apr 2026 01:51:59 -0500
+Subject: [PATCH 0/6] *** SUBJECT HERE ***
+
+*** BLURB HERE ***
+
+Sean Smith (6):
+  vfs: add provenance_time (ptime) infrastructure
+  btrfs: add provenance time (ptime) support
+  ntfs3: map ptime to NTFS creation time with rename-over
+  ext4: add dedicated ptime field alongside i_crtime
+  fat: map ptime to FAT creation time with rename-over
+  exfat: map ptime to exFAT creation time with rename-over
+
+ fs/attr.c                       |  6 +++-
+ fs/btrfs/btrfs_inode.h          |  4 +++
+ fs/btrfs/delayed-inode.c        |  4 +++
+ fs/btrfs/fs.h                   |  3 +-
+ fs/btrfs/inode.c                | 43 +++++++++++++++++++++++++
+ fs/btrfs/tree-log.c             |  2 ++
+ fs/btrfs/volumes.c              |  2 +-
+ fs/exfat/file.c                 |  9 ++++++
+ fs/exfat/namei.c                | 21 +++++++++++--
+ fs/ext4/ext4.h                  |  3 ++
+ fs/ext4/inode.c                 | 14 +++++++++
+ fs/ext4/namei.c                 | 13 ++++++++
+ fs/fat/file.c                   |  6 ++++
+ fs/fat/namei_vfat.c             | 20 ++++++++++--
+ fs/init.c                       |  2 +-
+ fs/ntfs3/file.c                 | 13 ++++++++
+ fs/ntfs3/frecord.c              |  8 +++++
+ fs/ntfs3/namei.c                | 14 +++++++++
+ fs/stat.c                       |  2 ++
+ fs/utimes.c                     | 56 +++++++++++++++++++++++++--------
+ include/linux/fs.h              |  5 ++-
+ include/linux/stat.h            |  1 +
+ include/uapi/linux/btrfs.h      |  1 +
+ include/uapi/linux/btrfs_tree.h |  4 ++-
+ include/uapi/linux/fcntl.h      |  3 ++
+ include/uapi/linux/stat.h       |  4 ++-
+ init/initramfs.c                |  2 +-
+ 27 files changed, 239 insertions(+), 26 deletions(-)
+
+-- 
+2.53.0
+

@@ -1,0 +1,111 @@
+From 2e56591a7e0e9175679da36763b2e64b8dfb54a0 Mon Sep 17 00:00:00 2001
+From: Sean Smith <DefendTheDisabled@gmail.com>
+Date: Sun, 5 Apr 2026 01:50:54 -0500
+Subject: [PATCH 3/6] ntfs3: map ptime to NTFS creation time with rename-over
+
+Map ptime to the NTFS Date Created field in $STANDARD_INFORMATION.
+This is a mapped-ptime implementation: setting ptime overwrites the
+creation time. Justified because Windows treats NTFS creation time
+as mutable via SetFileTime() - it was never truly immutable.
+
+Getattr: report NTFS creation time as ptime.
+Setattr: write ptime to NTFS creation time via frecord cr_time path.
+Rename-over: save target creation time before unlink, restore to
+  source after rename. Replicates Windows behavior where creation
+  time survives application atomic saves.
+
+Round-trip: NTFS Date Created -> Btrfs ptime -> NTFS Date Created
+preserves the original creation date through cross-FS copies.
+
+Signed-off-by: Sean Smith <DefendTheDisabled@gmail.com>
+---
+ fs/ntfs3/file.c    | 13 +++++++++++++
+ fs/ntfs3/frecord.c |  8 ++++++++
+ fs/ntfs3/namei.c   | 14 ++++++++++++++
+ 3 files changed, 35 insertions(+)
+
+diff --git a/fs/ntfs3/file.c b/fs/ntfs3/file.c
+index 13d014b87..8688a48b1 100644
+--- a/fs/ntfs3/file.c
++++ b/fs/ntfs3/file.c
+@@ -161,6 +161,13 @@ int ntfs_getattr(struct mnt_idmap *idmap, const struct path *path,
+ 
+ 	stat->result_mask |= STATX_BTIME;
+ 	stat->btime = ni->i_crtime;
++
++	/* Map NTFS creation time to ptime (provenance time) */
++	if (request_mask & STATX_PTIME) {
++		stat->ptime = ni->i_crtime;
++		stat->result_mask |= STATX_PTIME;
++	}
++
+ 	stat->blksize = ni->mi.sbi->cluster_size; /* 512, 1K, ..., 2M */
+ 
+ 	if (inode->i_flags & S_IMMUTABLE)
+@@ -857,6 +864,12 @@ int ntfs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
+ 		i_size_write(inode, newsize);
+ 	}
+ 
++	/* Accept ptime and store as NTFS creation time */
++	if (ia_valid & ATTR_PTIME) {
++		ni->i_crtime = attr->ia_ptime;
++		ni->ni_flags |= NI_FLAG_UPDATE_PARENT;
++	}
++
+ 	setattr_copy(idmap, inode, attr);
+ 
+ 	if (mode != inode->i_mode) {
+diff --git a/fs/ntfs3/frecord.c b/fs/ntfs3/frecord.c
+index d5bbd47e1..b164b2f50 100644
+--- a/fs/ntfs3/frecord.c
++++ b/fs/ntfs3/frecord.c
+@@ -3197,6 +3197,14 @@ int ni_write_inode(struct inode *inode, int sync, const char *hint)
+ 			modified = true;
+ 		}
+ 
++		/* Write creation time (ptime maps to NTFS cr_time) */
++		ts = ni->i_crtime;
++		dup.cr_time = kernel2nt(&ts);
++		if (std->cr_time != dup.cr_time) {
++			std->cr_time = dup.cr_time;
++			modified = true;
++		}
++
+ 		dup.fa = ni->std_fa;
+ 		if (std->fa != dup.fa) {
+ 			std->fa = dup.fa;
+diff --git a/fs/ntfs3/namei.c b/fs/ntfs3/namei.c
+index b2af8f695..40d06884f 100644
+--- a/fs/ntfs3/namei.c
++++ b/fs/ntfs3/namei.c
+@@ -292,6 +292,16 @@ static int ntfs_rename(struct mnt_idmap *idmap, struct inode *dir,
+ 		return -EINVAL;
+ 	}
+ 
++	/* ptime rename-over: save target creation time before unlink */
++	struct timespec64 saved_crtime = {};
++	bool inherit_crtime = false;
++
++	if (new_inode && S_ISREG(inode->i_mode) &&
++	    S_ISREG(new_inode->i_mode) && inode->i_nlink == 1) {
++		saved_crtime = ntfs_i(new_inode)->i_crtime;
++		inherit_crtime = true;
++	}
++
+ 	if (new_inode) {
+ 		/* Target name exists. Unlink it. */
+ 		dget(new_dentry);
+@@ -330,6 +340,10 @@ static int ntfs_rename(struct mnt_idmap *idmap, struct inode *dir,
+ 
+ 	err = ni_rename(dir_ni, new_dir_ni, ni, de, new_de);
+ 	if (!err) {
++		/* ptime rename-over: inherit target creation time */
++		if (inherit_crtime)
++			ni->i_crtime = saved_crtime;
++
+ 		simple_rename_timestamp(dir, dentry, new_dir, new_dentry);
+ 		mark_inode_dirty(inode);
+ 		mark_inode_dirty(dir);
+-- 
+2.53.0
+

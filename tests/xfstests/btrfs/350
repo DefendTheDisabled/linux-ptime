@@ -1,0 +1,53 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2026 Sean.  All Rights Reserved.
+#
+# FS QA Test No. btrfs/350
+#
+# Test ptime survives Btrfs snapshot.
+# Set ptime on a file, create a read-only snapshot of the subvolume,
+# verify ptime is visible in the snapshot.
+#
+. ./common/preamble
+_begin_fstest auto quick ptime snapshot
+
+. ./common/ptime
+
+_require_scratch_ptime
+
+_scratch_mkfs >> $seqres.full 2>&1
+_scratch_mount
+
+testfile=$SCRATCH_MNT/ptime_snap_test
+snapdir=$SCRATCH_MNT/snap1
+
+echo "snapshot test" > $testfile
+_ptime_set $testfile 1560608400 777000000
+
+# Verify ptime before snapshot
+sec=$(_ptime_get_sec $testfile)
+echo "Before snapshot sec: $sec"
+
+# Create read-only snapshot
+$BTRFS_UTIL_PROG subvolume snapshot -r $SCRATCH_MNT $snapdir \
+	>> $seqres.full 2>&1 || _fail "snapshot creation failed"
+
+# Read ptime from snapshot
+sec=$(_ptime_get_sec $snapdir/ptime_snap_test)
+nsec=$(_ptime_get_nsec $snapdir/ptime_snap_test)
+echo "In snapshot sec: $sec"
+echo "In snapshot nsec: $nsec"
+
+# Modify ptime on the original — snapshot should retain the old value
+_ptime_set $testfile 9999999 0
+sec_orig=$(_ptime_get_sec $testfile)
+sec_snap=$(_ptime_get_sec $snapdir/ptime_snap_test)
+echo "Original after update: $sec_orig"
+echo "Snapshot after update: $sec_snap"
+
+# Cleanup snapshot
+$BTRFS_UTIL_PROG subvolume delete $snapdir >> $seqres.full 2>&1
+
+_scratch_unmount
+status=0
+exit

@@ -1,0 +1,90 @@
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2026 Sean (ptime kernel patch).
+#
+# Common helpers for provenance time (ptime) tests.
+#
+
+# Check that the running kernel supports ptime (STATX_PTIME via statx,
+# AT_UTIME_PTIME via utimensat).  Uses the TEST filesystem.
+_require_ptime()
+{
+	local testfile=$TEST_DIR/ptime_support_test
+	local ptime_set=$here/src/ptime_set
+	local ptime_get=$here/src/ptime_get
+
+	[ -x "$ptime_set" ] || _notrun "ptime_set helper not built"
+	[ -x "$ptime_get" ] || _notrun "ptime_get helper not built"
+
+	echo "ptime_test" > $testfile
+	$ptime_set $testfile 1234567890 0 >> $seqres.full 2>&1
+	if [ $? -ne 0 ]; then
+		rm -f $testfile
+		_notrun "Kernel does not support AT_UTIME_PTIME"
+	fi
+
+	local result=$($ptime_get $testfile 2>>$seqres.full)
+	rm -f $testfile
+
+	local sec=$(echo "$result" | cut -d' ' -f1)
+	if [ "$sec" != "1234567890" ]; then
+		_notrun "Kernel does not support STATX_PTIME (got sec=$sec)"
+	fi
+}
+
+# Like _require_ptime but checks on SCRATCH_MNT (for tests that only
+# use the scratch device).
+_require_scratch_ptime()
+{
+	_require_scratch
+	_scratch_mkfs >> $seqres.full 2>&1
+	_scratch_mount
+
+	local testfile=$SCRATCH_MNT/ptime_support_test
+	local ptime_set=$here/src/ptime_set
+	local ptime_get=$here/src/ptime_get
+
+	[ -x "$ptime_set" ] || _notrun "ptime_set helper not built"
+	[ -x "$ptime_get" ] || _notrun "ptime_get helper not built"
+
+	echo "ptime_test" > $testfile
+	$ptime_set $testfile 1234567890 0 >> $seqres.full 2>&1
+	if [ $? -ne 0 ]; then
+		_scratch_unmount
+		_notrun "Kernel does not support AT_UTIME_PTIME"
+	fi
+
+	local result=$($ptime_get $testfile 2>>$seqres.full)
+	rm -f $testfile
+
+	local sec=$(echo "$result" | cut -d' ' -f1)
+	_scratch_unmount
+
+	if [ "$sec" != "1234567890" ]; then
+		_notrun "Scratch FS does not support reading ptime (got sec=$sec)"
+	fi
+}
+
+# Set ptime on a file.  Args: <file> <epoch_sec> [nsec]
+_ptime_set()
+{
+	$here/src/ptime_set "$@"
+}
+
+# Get ptime from a file.  Prints "<sec> <nsec>" to stdout.
+# Returns 2 if ptime not in statx mask (unsupported).
+_ptime_get()
+{
+	$here/src/ptime_get "$1"
+}
+
+# Get just the seconds component of ptime.
+_ptime_get_sec()
+{
+	$here/src/ptime_get "$1" | cut -d' ' -f1
+}
+
+# Get just the nanoseconds component of ptime.
+_ptime_get_nsec()
+{
+	$here/src/ptime_get "$1" | cut -d' ' -f2
+}

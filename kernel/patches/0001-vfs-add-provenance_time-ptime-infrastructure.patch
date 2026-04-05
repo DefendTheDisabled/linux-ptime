@@ -1,0 +1,325 @@
+From c621e375f7ed3d1efd0500a7db4792fa7107f86b Mon Sep 17 00:00:00 2001
+From: Sean Smith <DefendTheDisabled@gmail.com>
+Date: Sun, 5 Apr 2026 01:50:54 -0500
+Subject: [PATCH 1/6] vfs: add provenance_time (ptime) infrastructure
+
+Add a new settable inode timestamp, provenance_time (ptime), for tracking
+the original creation date of file content across filesystem boundaries.
+
+ptime is distinct from btime (forensic, immutable): it records when file
+content first came into existence on any filesystem, and is designed to
+be set during cross-filesystem migration and preserved through copies.
+
+VFS changes:
+- ATTR_PTIME (bit 19) and ATTR_PTIME_SET (bit 20) in struct iattr
+- STATX_PTIME (0x00040000) in struct statx at offset 0xC0
+- AT_UTIME_PTIME (0x20000) flag for utimensat()
+- ptime field in struct kstat
+- Permission model matches mtime (owner or CAP_FOWNER)
+- UTIME_NOW and UTIME_OMIT supported for ptime element
+- All existing vfs_utimes() callers updated for new flags parameter
+
+Signed-off-by: Sean Smith <DefendTheDisabled@gmail.com>
+---
+ fs/attr.c                  |  6 +++-
+ fs/btrfs/volumes.c         |  2 +-
+ fs/init.c                  |  2 +-
+ fs/stat.c                  |  2 ++
+ fs/utimes.c                | 56 +++++++++++++++++++++++++++++---------
+ include/linux/fs.h         |  5 +++-
+ include/linux/stat.h       |  1 +
+ include/uapi/linux/fcntl.h |  3 ++
+ include/uapi/linux/stat.h  |  4 ++-
+ init/initramfs.c           |  2 +-
+ 10 files changed, 64 insertions(+), 19 deletions(-)
+
+diff --git a/fs/attr.c b/fs/attr.c
+index b9ec6b47b..7fa9c01d1 100644
+--- a/fs/attr.c
++++ b/fs/attr.c
+@@ -206,7 +206,7 @@ int setattr_prepare(struct mnt_idmap *idmap, struct dentry *dentry,
+ 	}
+ 
+ 	/* Check for setting the inode time. */
+-	if (ia_valid & (ATTR_MTIME_SET | ATTR_ATIME_SET | ATTR_TIMES_SET)) {
++	if (ia_valid & (ATTR_MTIME_SET | ATTR_ATIME_SET | ATTR_PTIME_SET | ATTR_TIMES_SET)) {
+ 		if (!inode_owner_or_capable(idmap, inode))
+ 			return -EPERM;
+ 	}
+@@ -466,6 +466,10 @@ int notify_change(struct mnt_idmap *idmap, struct dentry *dentry,
+ 		attr->ia_mtime = timestamp_truncate(attr->ia_mtime, inode);
+ 	else
+ 		attr->ia_mtime = now;
++	if (ia_valid & ATTR_PTIME_SET)
++		attr->ia_ptime = timestamp_truncate(attr->ia_ptime, inode);
++	else if (ia_valid & ATTR_PTIME)
++		attr->ia_ptime = now;
+ 
+ 	if (ia_valid & ATTR_KILL_PRIV) {
+ 		error = security_inode_need_killpriv(dentry);
+diff --git a/fs/btrfs/volumes.c b/fs/btrfs/volumes.c
+index 052b830a0..0e81f2cc9 100644
+--- a/fs/btrfs/volumes.c
++++ b/fs/btrfs/volumes.c
+@@ -2117,7 +2117,7 @@ static void update_dev_time(const char *device_path)
+ 	struct path path;
+ 
+ 	if (!kern_path(device_path, LOOKUP_FOLLOW, &path)) {
+-		vfs_utimes(&path, NULL);
++		vfs_utimes(&path, NULL, 0);
+ 		path_put(&path);
+ 	}
+ }
+diff --git a/fs/init.c b/fs/init.c
+index e0f5429c0..e9a9f4d93 100644
+--- a/fs/init.c
++++ b/fs/init.c
+@@ -254,7 +254,7 @@ int __init init_utimes(char *filename, struct timespec64 *ts)
+ 	error = kern_path(filename, 0, &path);
+ 	if (error)
+ 		return error;
+-	error = vfs_utimes(&path, ts);
++	error = vfs_utimes(&path, ts, 0);
+ 	path_put(&path);
+ 	return error;
+ }
+diff --git a/fs/stat.c b/fs/stat.c
+index 6c79661e1..9284bb753 100644
+--- a/fs/stat.c
++++ b/fs/stat.c
+@@ -728,6 +728,8 @@ cp_statx(const struct kstat *stat, struct statx __user *buffer)
+ 	tmp.stx_atime.tv_nsec = stat->atime.tv_nsec;
+ 	tmp.stx_btime.tv_sec = stat->btime.tv_sec;
+ 	tmp.stx_btime.tv_nsec = stat->btime.tv_nsec;
++	tmp.stx_ptime.tv_sec = stat->ptime.tv_sec;
++	tmp.stx_ptime.tv_nsec = stat->ptime.tv_nsec;
+ 	tmp.stx_ctime.tv_sec = stat->ctime.tv_sec;
+ 	tmp.stx_ctime.tv_nsec = stat->ctime.tv_nsec;
+ 	tmp.stx_mtime.tv_sec = stat->mtime.tv_sec;
+diff --git a/fs/utimes.c b/fs/utimes.c
+index 86f8ce8cd..50b5ad296 100644
+--- a/fs/utimes.c
++++ b/fs/utimes.c
+@@ -17,10 +17,10 @@ static bool nsec_valid(long nsec)
+ 	return nsec >= 0 && nsec <= 999999999;
+ }
+ 
+-int vfs_utimes(const struct path *path, struct timespec64 *times)
++int vfs_utimes(const struct path *path, struct timespec64 *times, int flags)
+ {
+ 	int error;
+-	struct iattr newattrs;
++	struct iattr newattrs = {};
+ 	struct inode *inode = path->dentry->d_inode;
+ 	struct delegated_inode delegated_inode = { };
+ 
+@@ -28,7 +28,11 @@ int vfs_utimes(const struct path *path, struct timespec64 *times)
+ 		if (!nsec_valid(times[0].tv_nsec) ||
+ 		    !nsec_valid(times[1].tv_nsec))
+ 			return -EINVAL;
+-		if (times[0].tv_nsec == UTIME_NOW &&
++		if ((flags & AT_UTIME_PTIME) &&
++		    !nsec_valid(times[2].tv_nsec))
++			return -EINVAL;
++		if (!(flags & AT_UTIME_PTIME) &&
++		    times[0].tv_nsec == UTIME_NOW &&
+ 		    times[1].tv_nsec == UTIME_NOW)
+ 			times = NULL;
+ 	}
+@@ -52,6 +56,15 @@ int vfs_utimes(const struct path *path, struct timespec64 *times)
+ 			newattrs.ia_mtime = times[1];
+ 			newattrs.ia_valid |= ATTR_MTIME_SET;
+ 		}
++		if (flags & AT_UTIME_PTIME) {
++			if (times[2].tv_nsec != UTIME_OMIT) {
++				newattrs.ia_valid |= ATTR_PTIME;
++				if (times[2].tv_nsec != UTIME_NOW) {
++					newattrs.ia_ptime = times[2];
++					newattrs.ia_valid |= ATTR_PTIME_SET;
++				}
++			}
++		}
+ 		/*
+ 		 * Tell setattr_prepare(), that this is an explicit time
+ 		 * update, even if neither ATTR_ATIME_SET nor ATTR_MTIME_SET
+@@ -84,7 +97,7 @@ static int do_utimes_path(int dfd, const char __user *filename,
+ 	struct path path;
+ 	int lookup_flags = 0, error;
+ 
+-	if (flags & ~(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH))
++	if (flags & ~(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH | AT_UTIME_PTIME))
+ 		return -EINVAL;
+ 
+ 	if (!(flags & AT_SYMLINK_NOFOLLOW))
+@@ -97,7 +110,7 @@ static int do_utimes_path(int dfd, const char __user *filename,
+ 	if (error)
+ 		return error;
+ 
+-	error = vfs_utimes(&path, times);
++	error = vfs_utimes(&path, times, flags);
+ 	path_put(&path);
+ 	if (retry_estale(error, lookup_flags)) {
+ 		lookup_flags |= LOOKUP_REVAL;
+@@ -109,13 +122,13 @@ static int do_utimes_path(int dfd, const char __user *filename,
+ 
+ static int do_utimes_fd(int fd, struct timespec64 *times, int flags)
+ {
+-	if (flags)
++	if (flags & ~AT_UTIME_PTIME)
+ 		return -EINVAL;
+ 
+ 	CLASS(fd, f)(fd);
+ 	if (fd_empty(f))
+ 		return -EBADF;
+-	return vfs_utimes(&fd_file(f)->f_path, times);
++	return vfs_utimes(&fd_file(f)->f_path, times, flags);
+ }
+ 
+ /*
+@@ -144,16 +157,24 @@ long do_utimes(int dfd, const char __user *filename, struct timespec64 *times,
+ SYSCALL_DEFINE4(utimensat, int, dfd, const char __user *, filename,
+ 		struct __kernel_timespec __user *, utimes, int, flags)
+ {
+-	struct timespec64 tstimes[2];
++	struct timespec64 tstimes[3];
++
++	if ((flags & AT_UTIME_PTIME) && !utimes)
++		return -EINVAL;
+ 
+ 	if (utimes) {
+ 		if ((get_timespec64(&tstimes[0], &utimes[0]) ||
+-			get_timespec64(&tstimes[1], &utimes[1])))
++		     get_timespec64(&tstimes[1], &utimes[1])))
++			return -EFAULT;
++		if ((flags & AT_UTIME_PTIME) &&
++		    get_timespec64(&tstimes[2], &utimes[2]))
+ 			return -EFAULT;
+ 
+ 		/* Nothing to do, we must not even check the path.  */
+ 		if (tstimes[0].tv_nsec == UTIME_OMIT &&
+-		    tstimes[1].tv_nsec == UTIME_OMIT)
++		    tstimes[1].tv_nsec == UTIME_OMIT &&
++		    (!(flags & AT_UTIME_PTIME) ||
++		     tstimes[2].tv_nsec == UTIME_OMIT))
+ 			return 0;
+ 	}
+ 
+@@ -247,14 +268,23 @@ SYSCALL_DEFINE2(utime32, const char __user *, filename,
+ 
+ SYSCALL_DEFINE4(utimensat_time32, unsigned int, dfd, const char __user *, filename, struct old_timespec32 __user *, t, int, flags)
+ {
+-	struct timespec64 tv[2];
++	struct timespec64 tv[3];
++
++	if ((flags & AT_UTIME_PTIME) && !t)
++		return -EINVAL;
+ 
+-	if  (t) {
++	if (t) {
+ 		if (get_old_timespec32(&tv[0], &t[0]) ||
+ 		    get_old_timespec32(&tv[1], &t[1]))
+ 			return -EFAULT;
++		if ((flags & AT_UTIME_PTIME) &&
++		    get_old_timespec32(&tv[2], &t[2]))
++			return -EFAULT;
+ 
+-		if (tv[0].tv_nsec == UTIME_OMIT && tv[1].tv_nsec == UTIME_OMIT)
++		if (tv[0].tv_nsec == UTIME_OMIT &&
++		    tv[1].tv_nsec == UTIME_OMIT &&
++		    (!(flags & AT_UTIME_PTIME) ||
++		     tv[2].tv_nsec == UTIME_OMIT))
+ 			return 0;
+ 	}
+ 	return do_utimes(dfd, filename, t ? tv : NULL, flags);
+diff --git a/include/linux/fs.h b/include/linux/fs.h
+index a01621fa6..07719e216 100644
+--- a/include/linux/fs.h
++++ b/include/linux/fs.h
+@@ -239,6 +239,8 @@ typedef int (dio_iodone_t)(struct kiocb *iocb, loff_t offset,
+ #define ATTR_TIMES_SET	(1 << 16)
+ #define ATTR_TOUCH	(1 << 17)
+ #define ATTR_DELEG	(1 << 18) /* Delegated attrs. Don't break write delegations */
++#define ATTR_PTIME	(1 << 19) /* Set provenance time */
++#define ATTR_PTIME_SET	(1 << 20) /* Set provenance time to specific value */
+ 
+ /*
+  * Whiteout is represented by a char device.  The following constants define the
+@@ -283,6 +285,7 @@ struct iattr {
+ 	struct timespec64 ia_atime;
+ 	struct timespec64 ia_mtime;
+ 	struct timespec64 ia_ctime;
++	struct timespec64 ia_ptime;
+ 
+ 	/*
+ 	 * Not an attribute, but an auxiliary info for filesystems wanting to
+@@ -1814,7 +1817,7 @@ int vfs_mkobj(struct dentry *, umode_t,
+ 
+ int vfs_fchown(struct file *file, uid_t user, gid_t group);
+ int vfs_fchmod(struct file *file, umode_t mode);
+-int vfs_utimes(const struct path *path, struct timespec64 *times);
++int vfs_utimes(const struct path *path, struct timespec64 *times, int flags);
+ 
+ #ifdef CONFIG_COMPAT
+ extern long compat_ptr_ioctl(struct file *file, unsigned int cmd,
+diff --git a/include/linux/stat.h b/include/linux/stat.h
+index e3d00e7bb..52272000c 100644
+--- a/include/linux/stat.h
++++ b/include/linux/stat.h
+@@ -48,6 +48,7 @@ struct kstat {
+ 	struct timespec64 mtime;
+ 	struct timespec64 ctime;
+ 	struct timespec64 btime;			/* File creation time */
++	struct timespec64 ptime;			/* Provenance time */
+ 	u64		blocks;
+ 	u64		mnt_id;
+ 	u64		change_cookie;
+diff --git a/include/uapi/linux/fcntl.h b/include/uapi/linux/fcntl.h
+index aadfbf6e0..f80ce0295 100644
+--- a/include/uapi/linux/fcntl.h
++++ b/include/uapi/linux/fcntl.h
+@@ -190,4 +190,7 @@ struct delegation {
+ #define AT_EXECVE_CHECK		0x10000	/* Only perform a check if execution
+ 					   would be allowed. */
+ 
++/* Flag for utimensat(2): times[2] carries provenance time */
++#define AT_UTIME_PTIME		0x20000
++
+ #endif /* _UAPI_LINUX_FCNTL_H */
+diff --git a/include/uapi/linux/stat.h b/include/uapi/linux/stat.h
+index 1686861aa..0c8db3715 100644
+--- a/include/uapi/linux/stat.h
++++ b/include/uapi/linux/stat.h
+@@ -187,7 +187,8 @@ struct statx {
+ 	__u32	__spare2[1];
+ 
+ 	/* 0xc0 */
+-	__u64	__spare3[8];	/* Spare space for future expansion */
++	struct statx_timestamp	stx_ptime;	/* File provenance time */
++	__u64	__spare3[6];		/* Spare space for future expansion */
+ 
+ 	/* 0x100 */
+ };
+@@ -219,6 +220,7 @@ struct statx {
+ #define STATX_SUBVOL		0x00008000U	/* Want/got stx_subvol */
+ #define STATX_WRITE_ATOMIC	0x00010000U	/* Want/got atomic_write_* fields */
+ #define STATX_DIO_READ_ALIGN	0x00020000U	/* Want/got dio read alignment info */
++#define STATX_PTIME		0x00040000U	/* Want/got stx_ptime */
+ 
+ #define STATX__RESERVED		0x80000000U	/* Reserved for future struct statx expansion */
+ 
+diff --git a/init/initramfs.c b/init/initramfs.c
+index 6ddbfb17f..e066b1fee 100644
+--- a/init/initramfs.c
++++ b/init/initramfs.c
+@@ -139,7 +139,7 @@ static void __init do_utime(char *filename, time64_t mtime)
+ static void __init do_utime_path(const struct path *path, time64_t mtime)
+ {
+ 	struct timespec64 t[2] = { { .tv_sec = mtime }, { .tv_sec = mtime } };
+-	vfs_utimes(path, t);
++	vfs_utimes(path, t, 0);
+ }
+ 
+ static __initdata LIST_HEAD(dir_list);
+-- 
+2.53.0
+

@@ -1,0 +1,96 @@
+From a7c981250c51e6875c439665a564c8e062369cc8 Mon Sep 17 00:00:00 2001
+From: Sean Smith <DefendTheDisabled@gmail.com>
+Date: Sun, 5 Apr 2026 01:50:55 -0500
+Subject: [PATCH 6/6] exfat: map ptime to exFAT creation time with rename-over
+
+Map ptime to the exFAT creation time field. exFAT creation time
+has 10ms precision.
+
+Getattr: report creation time as ptime.
+Setattr: write ptime to i_crtime.
+Rename-over: save target creation time before __exfat_rename, restore
+  after. Preserves creation time across atomic saves.
+
+Signed-off-by: Sean Smith <DefendTheDisabled@gmail.com>
+---
+ fs/btrfs/inode.c |  3 ++-
+ fs/exfat/file.c  |  9 +++++++++
+ fs/exfat/namei.c | 21 ++++++++++++++++++---
+ 3 files changed, 29 insertions(+), 4 deletions(-)
+
+diff --git a/fs/btrfs/inode.c b/fs/btrfs/inode.c
+index dce80561a..918dfd4c5 100644
+--- a/fs/btrfs/inode.c
++++ b/fs/btrfs/inode.c
+@@ -8715,7 +8715,8 @@ static int btrfs_rename(struct mnt_idmap *idmap,
+ 		/* Note: if rename fails below, ptime mutation is harmless —
+ 		 * the source file keeps its previous ptime=0 semantics since
+ 		 * the rename didn't complete. The in-memory value will be
+-		 * overwritten on next inode read from disk. */
++		 * overwritten on next inode read from disk.
++		 */
+ 
+ 		ret = btrfs_update_inode(trans, BTRFS_I(old_inode));
+ 		if (unlikely(ret)) {
+diff --git a/fs/exfat/file.c b/fs/exfat/file.c
+index 536c8078f..b6438bd79 100644
+--- a/fs/exfat/file.c
++++ b/fs/exfat/file.c
+@@ -277,6 +277,11 @@ int exfat_getattr(struct mnt_idmap *idmap, const struct path *path,
+ 	stat->result_mask |= STATX_BTIME;
+ 	stat->btime.tv_sec = ei->i_crtime.tv_sec;
+ 	stat->btime.tv_nsec = ei->i_crtime.tv_nsec;
++	if (request_mask & STATX_PTIME) {
++		stat->result_mask |= STATX_PTIME;
++		stat->ptime.tv_sec = ei->i_crtime.tv_sec;
++		stat->ptime.tv_nsec = ei->i_crtime.tv_nsec;
++	}
+ 	stat->blksize = EXFAT_SB(inode->i_sb)->cluster_size;
+ 	return 0;
+ }
+@@ -337,6 +342,10 @@ int exfat_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
+ 	if (attr->ia_valid & ATTR_SIZE)
+ 		inode_set_mtime_to_ts(inode, inode_set_ctime_current(inode));
+ 
++	if (attr->ia_valid & ATTR_PTIME) {
++		struct exfat_inode_info *exi = EXFAT_I(inode);
++		exi->i_crtime = attr->ia_ptime;
++	}
+ 	setattr_copy(idmap, inode, attr);
+ 	exfat_truncate_inode_atime(inode);
+ 
+diff --git a/fs/exfat/namei.c b/fs/exfat/namei.c
+index dfe957493..9c0b59e00 100644
+--- a/fs/exfat/namei.c
++++ b/fs/exfat/namei.c
+@@ -1262,9 +1262,24 @@ static int exfat_rename(struct mnt_idmap *idmap,
+ 	old_inode = old_dentry->d_inode;
+ 	new_inode = new_dentry->d_inode;
+ 
+-	err = __exfat_rename(old_dir, EXFAT_I(old_inode), new_dir, new_dentry);
+-	if (err)
+-		goto unlock;
++	/* ptime rename-over: save target creation time */
++	{
++		struct timespec64 saved_crtime = {};
++		bool inherit_crtime = false;
++
++		if (new_inode && S_ISREG(old_inode->i_mode) &&
++		    S_ISREG(new_inode->i_mode) && old_inode->i_nlink == 1) {
++			saved_crtime = EXFAT_I(new_inode)->i_crtime;
++			inherit_crtime = true;
++		}
++
++		err = __exfat_rename(old_dir, EXFAT_I(old_inode), new_dir, new_dentry);
++		if (err)
++			goto unlock;
++
++		if (inherit_crtime)
++			EXFAT_I(old_inode)->i_crtime = saved_crtime;
++	}
+ 
+ 	inode_inc_iversion(new_dir);
+ 	simple_rename_timestamp(old_dir, old_dentry, new_dir, new_dentry);
+-- 
+2.53.0
+

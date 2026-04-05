@@ -1,0 +1,119 @@
+From 27c11b25f2e8be850af2d634abdbb3347a27df7e Mon Sep 17 00:00:00 2001
+From: Sean Smith <DefendTheDisabled@gmail.com>
+Date: Sun, 5 Apr 2026 01:50:54 -0500
+Subject: [PATCH 4/6] ext4: add dedicated ptime field alongside i_crtime
+
+Add i_ptime (__le32) and i_ptime_extra (__le32) to the ext4 on-disk
+inode structure after i_projid. Total: 8 bytes in the extended inode
+area. i_crtime remains untouched as immutable birth time.
+
+This is a native-ptime implementation: ptime and btime are separate
+fields. On 256-byte inodes (modern default), both fit easily. On
+128-byte inodes, ptime is silently unavailable (same graceful
+degradation as i_crtime via EXT4_FITS_IN_INODE).
+
+Uses existing EXT4_EINODE_GET_XTIME/SET_XTIME macros for read/write.
+Rename-over: when a file with ptime=0 replaces a file with ptime set,
+inherit target ptime (same zero-sentinel logic as Btrfs).
+
+Signed-off-by: Sean Smith <DefendTheDisabled@gmail.com>
+---
+ fs/ext4/ext4.h  |  3 +++
+ fs/ext4/inode.c | 14 ++++++++++++++
+ fs/ext4/namei.c | 13 +++++++++++++
+ 3 files changed, 30 insertions(+)
+
+diff --git a/fs/ext4/ext4.h b/fs/ext4/ext4.h
+index f1c476303..5c2812637 100644
+--- a/fs/ext4/ext4.h
++++ b/fs/ext4/ext4.h
+@@ -860,6 +860,8 @@ struct ext4_inode {
+ 	__le32  i_crtime_extra; /* extra FileCreationtime (nsec << 2 | epoch) */
+ 	__le32  i_version_hi;	/* high 32 bits for 64-bit version */
+ 	__le32	i_projid;	/* Project ID */
++	__le32	i_ptime;		/* Provenance time */
++	__le32	i_ptime_extra;	/* extra Provenance time (nsec << 2 | epoch) */
+ };
+ 
+ #define EXT4_EPOCH_BITS 2
+@@ -1136,6 +1138,7 @@ struct ext4_inode_info {
+ 	 * struct timespec64 i_{a,c,m}time in the generic inode.
+ 	 */
+ 	struct timespec64 i_crtime;
++	struct timespec64 i_ptime;
+ 
+ 	/* mballoc */
+ 	atomic_t i_prealloc_active;
+diff --git a/fs/ext4/inode.c b/fs/ext4/inode.c
+index 625cfbf61..15b6b6dc6 100644
+--- a/fs/ext4/inode.c
++++ b/fs/ext4/inode.c
+@@ -4753,6 +4753,7 @@ static int ext4_fill_raw_inode(struct inode *inode, struct ext4_inode *raw_inode
+ 	EXT4_INODE_SET_MTIME(inode, raw_inode);
+ 	EXT4_INODE_SET_ATIME(inode, raw_inode);
+ 	EXT4_EINODE_SET_XTIME(i_crtime, ei, raw_inode);
++	EXT4_EINODE_SET_XTIME(i_ptime, ei, raw_inode);
+ 
+ 	raw_inode->i_dtime = cpu_to_le32(ei->i_dtime);
+ 	raw_inode->i_flags = cpu_to_le32(ei->i_flags & 0xFFFFFFFF);
+@@ -5409,6 +5410,7 @@ struct inode *__ext4_iget(struct super_block *sb, unsigned long ino,
+ 	EXT4_INODE_GET_ATIME(inode, raw_inode);
+ 	EXT4_INODE_GET_MTIME(inode, raw_inode);
+ 	EXT4_EINODE_GET_XTIME(i_crtime, ei, raw_inode);
++	EXT4_EINODE_GET_XTIME(i_ptime, ei, raw_inode);
+ 
+ 	if (likely(!test_opt2(inode->i_sb, HURD_COMPAT))) {
+ 		u64 ivers = le32_to_cpu(raw_inode->i_disk_version);
+@@ -6061,6 +6063,9 @@ int ext4_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
+ 	if (!error) {
+ 		if (inc_ivers)
+ 			inode_inc_iversion(inode);
++		if (attr->ia_valid & ATTR_PTIME)
++			EXT4_I(inode)->i_ptime = attr->ia_ptime;
++
+ 		setattr_copy(idmap, inode, attr);
+ 		mark_inode_dirty(inode);
+ 	}
+@@ -6114,6 +6119,15 @@ int ext4_getattr(struct mnt_idmap *idmap, const struct path *path,
+ 		stat->btime.tv_nsec = ei->i_crtime.tv_nsec;
+ 	}
+ 
++	/* Report ptime from dedicated field, not crtime */
++	if ((request_mask & STATX_PTIME) &&
++	    EXT4_FITS_IN_INODE(raw_inode, ei, i_ptime) &&
++	    (ei->i_ptime.tv_sec || ei->i_ptime.tv_nsec)) {
++		stat->result_mask |= STATX_PTIME;
++		stat->ptime.tv_sec = ei->i_ptime.tv_sec;
++		stat->ptime.tv_nsec = ei->i_ptime.tv_nsec;
++	}
++
+ 	/*
+ 	 * Return the DIO alignment restrictions if requested.  We only return
+ 	 * this information when requested, since on encrypted files it might
+diff --git a/fs/ext4/namei.c b/fs/ext4/namei.c
+index c4b5e252a..1bfe4df24 100644
+--- a/fs/ext4/namei.c
++++ b/fs/ext4/namei.c
+@@ -3942,6 +3942,19 @@ static int ext4_rename(struct mnt_idmap *idmap, struct inode *old_dir,
+ 	 * rename.
+ 	 */
+ 	inode_set_ctime_current(old.inode);
++
++	/* ptime rename-over: preserve ptime across atomic saves */
++	if (new.inode && S_ISREG(old.inode->i_mode) &&
++	    S_ISREG(new.inode->i_mode) && old.inode->i_nlink == 1 &&
++	    !(flags & RENAME_WHITEOUT)) {
++		struct ext4_inode_info *old_ei = EXT4_I(old.inode);
++		struct ext4_inode_info *new_ei = EXT4_I(new.inode);
++
++		if (!old_ei->i_ptime.tv_sec && !old_ei->i_ptime.tv_nsec &&
++		    (new_ei->i_ptime.tv_sec || new_ei->i_ptime.tv_nsec))
++			old_ei->i_ptime = new_ei->i_ptime;
++	}
++
+ 	retval = ext4_mark_inode_dirty(handle, old.inode);
+ 	if (unlikely(retval))
+ 		goto end_rename;
+-- 
+2.53.0
+

@@ -1,0 +1,948 @@
+From c621e375f7ed3d1efd0500a7db4792fa7107f86b Mon Sep 17 00:00:00 2001
+From: Sean Smith <DefendTheDisabled@gmail.com>
+Date: Sun, 5 Apr 2026 01:50:54 -0500
+Subject: [PATCH 1/6] vfs: add provenance_time (ptime) infrastructure
+
+Add a new settable inode timestamp, provenance_time (ptime), for tracking
+the original creation date of file content across filesystem boundaries.
+
+ptime is distinct from btime (forensic, immutable): it records when file
+content first came into existence on any filesystem, and is designed to
+be set during cross-filesystem migration and preserved through copies.
+
+VFS changes:
+- ATTR_PTIME (bit 19) and ATTR_PTIME_SET (bit 20) in struct iattr
+- STATX_PTIME (0x00040000) in struct statx at offset 0xC0
+- AT_UTIME_PTIME (0x20000) flag for utimensat()
+- ptime field in struct kstat
+- Permission model matches mtime (owner or CAP_FOWNER)
+- UTIME_NOW and UTIME_OMIT supported for ptime element
+- All existing vfs_utimes() callers updated for new flags parameter
+
+Signed-off-by: Sean Smith <DefendTheDisabled@gmail.com>
+---
+ fs/attr.c                  |  6 +++-
+ fs/btrfs/volumes.c         |  2 +-
+ fs/init.c                  |  2 +-
+ fs/stat.c                  |  2 ++
+ fs/utimes.c                | 56 +++++++++++++++++++++++++++++---------
+ include/linux/fs.h         |  5 +++-
+ include/linux/stat.h       |  1 +
+ include/uapi/linux/fcntl.h |  3 ++
+ include/uapi/linux/stat.h  |  4 ++-
+ init/initramfs.c           |  2 +-
+ 10 files changed, 64 insertions(+), 19 deletions(-)
+
+diff --git a/fs/attr.c b/fs/attr.c
+index b9ec6b47b..7fa9c01d1 100644
+--- a/fs/attr.c
++++ b/fs/attr.c
+@@ -206,7 +206,7 @@ int setattr_prepare(struct mnt_idmap *idmap, struct dentry *dentry,
+ 	}
+ 
+ 	/* Check for setting the inode time. */
+-	if (ia_valid & (ATTR_MTIME_SET | ATTR_ATIME_SET | ATTR_TIMES_SET)) {
++	if (ia_valid & (ATTR_MTIME_SET | ATTR_ATIME_SET | ATTR_PTIME_SET | ATTR_TIMES_SET)) {
+ 		if (!inode_owner_or_capable(idmap, inode))
+ 			return -EPERM;
+ 	}
+@@ -466,6 +466,10 @@ int notify_change(struct mnt_idmap *idmap, struct dentry *dentry,
+ 		attr->ia_mtime = timestamp_truncate(attr->ia_mtime, inode);
+ 	else
+ 		attr->ia_mtime = now;
++	if (ia_valid & ATTR_PTIME_SET)
++		attr->ia_ptime = timestamp_truncate(attr->ia_ptime, inode);
++	else if (ia_valid & ATTR_PTIME)
++		attr->ia_ptime = now;
+ 
+ 	if (ia_valid & ATTR_KILL_PRIV) {
+ 		error = security_inode_need_killpriv(dentry);
+diff --git a/fs/btrfs/volumes.c b/fs/btrfs/volumes.c
+index 052b830a0..0e81f2cc9 100644
+--- a/fs/btrfs/volumes.c
++++ b/fs/btrfs/volumes.c
+@@ -2117,7 +2117,7 @@ static void update_dev_time(const char *device_path)
+ 	struct path path;
+ 
+ 	if (!kern_path(device_path, LOOKUP_FOLLOW, &path)) {
+-		vfs_utimes(&path, NULL);
++		vfs_utimes(&path, NULL, 0);
+ 		path_put(&path);
+ 	}
+ }
+diff --git a/fs/init.c b/fs/init.c
+index e0f5429c0..e9a9f4d93 100644
+--- a/fs/init.c
++++ b/fs/init.c
+@@ -254,7 +254,7 @@ int __init init_utimes(char *filename, struct timespec64 *ts)
+ 	error = kern_path(filename, 0, &path);
+ 	if (error)
+ 		return error;
+-	error = vfs_utimes(&path, ts);
++	error = vfs_utimes(&path, ts, 0);
+ 	path_put(&path);
+ 	return error;
+ }
+diff --git a/fs/stat.c b/fs/stat.c
+index 6c79661e1..9284bb753 100644
+--- a/fs/stat.c
++++ b/fs/stat.c
+@@ -728,6 +728,8 @@ cp_statx(const struct kstat *stat, struct statx __user *buffer)
+ 	tmp.stx_atime.tv_nsec = stat->atime.tv_nsec;
+ 	tmp.stx_btime.tv_sec = stat->btime.tv_sec;
+ 	tmp.stx_btime.tv_nsec = stat->btime.tv_nsec;
++	tmp.stx_ptime.tv_sec = stat->ptime.tv_sec;
++	tmp.stx_ptime.tv_nsec = stat->ptime.tv_nsec;
+ 	tmp.stx_ctime.tv_sec = stat->ctime.tv_sec;
+ 	tmp.stx_ctime.tv_nsec = stat->ctime.tv_nsec;
+ 	tmp.stx_mtime.tv_sec = stat->mtime.tv_sec;
+diff --git a/fs/utimes.c b/fs/utimes.c
+index 86f8ce8cd..50b5ad296 100644
+--- a/fs/utimes.c
++++ b/fs/utimes.c
+@@ -17,10 +17,10 @@ static bool nsec_valid(long nsec)
+ 	return nsec >= 0 && nsec <= 999999999;
+ }
+ 
+-int vfs_utimes(const struct path *path, struct timespec64 *times)
++int vfs_utimes(const struct path *path, struct timespec64 *times, int flags)
+ {
+ 	int error;
+-	struct iattr newattrs;
++	struct iattr newattrs = {};
+ 	struct inode *inode = path->dentry->d_inode;
+ 	struct delegated_inode delegated_inode = { };
+ 
+@@ -28,7 +28,11 @@ int vfs_utimes(const struct path *path, struct timespec64 *times)
+ 		if (!nsec_valid(times[0].tv_nsec) ||
+ 		    !nsec_valid(times[1].tv_nsec))
+ 			return -EINVAL;
+-		if (times[0].tv_nsec == UTIME_NOW &&
++		if ((flags & AT_UTIME_PTIME) &&
++		    !nsec_valid(times[2].tv_nsec))
++			return -EINVAL;
++		if (!(flags & AT_UTIME_PTIME) &&
++		    times[0].tv_nsec == UTIME_NOW &&
+ 		    times[1].tv_nsec == UTIME_NOW)
+ 			times = NULL;
+ 	}
+@@ -52,6 +56,15 @@ int vfs_utimes(const struct path *path, struct timespec64 *times)
+ 			newattrs.ia_mtime = times[1];
+ 			newattrs.ia_valid |= ATTR_MTIME_SET;
+ 		}
++		if (flags & AT_UTIME_PTIME) {
++			if (times[2].tv_nsec != UTIME_OMIT) {
++				newattrs.ia_valid |= ATTR_PTIME;
++				if (times[2].tv_nsec != UTIME_NOW) {
++					newattrs.ia_ptime = times[2];
++					newattrs.ia_valid |= ATTR_PTIME_SET;
++				}
++			}
++		}
+ 		/*
+ 		 * Tell setattr_prepare(), that this is an explicit time
+ 		 * update, even if neither ATTR_ATIME_SET nor ATTR_MTIME_SET
+@@ -84,7 +97,7 @@ static int do_utimes_path(int dfd, const char __user *filename,
+ 	struct path path;
+ 	int lookup_flags = 0, error;
+ 
+-	if (flags & ~(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH))
++	if (flags & ~(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH | AT_UTIME_PTIME))
+ 		return -EINVAL;
+ 
+ 	if (!(flags & AT_SYMLINK_NOFOLLOW))
+@@ -97,7 +110,7 @@ static int do_utimes_path(int dfd, const char __user *filename,
+ 	if (error)
+ 		return error;
+ 
+-	error = vfs_utimes(&path, times);
++	error = vfs_utimes(&path, times, flags);
+ 	path_put(&path);
+ 	if (retry_estale(error, lookup_flags)) {
+ 		lookup_flags |= LOOKUP_REVAL;
+@@ -109,13 +122,13 @@ static int do_utimes_path(int dfd, const char __user *filename,
+ 
+ static int do_utimes_fd(int fd, struct timespec64 *times, int flags)
+ {
+-	if (flags)
++	if (flags & ~AT_UTIME_PTIME)
+ 		return -EINVAL;
+ 
+ 	CLASS(fd, f)(fd);
+ 	if (fd_empty(f))
+ 		return -EBADF;
+-	return vfs_utimes(&fd_file(f)->f_path, times);
++	return vfs_utimes(&fd_file(f)->f_path, times, flags);
+ }
+ 
+ /*
+@@ -144,16 +157,24 @@ long do_utimes(int dfd, const char __user *filename, struct timespec64 *times,
+ SYSCALL_DEFINE4(utimensat, int, dfd, const char __user *, filename,
+ 		struct __kernel_timespec __user *, utimes, int, flags)
+ {
+-	struct timespec64 tstimes[2];
++	struct timespec64 tstimes[3];
++
++	if ((flags & AT_UTIME_PTIME) && !utimes)
++		return -EINVAL;
+ 
+ 	if (utimes) {
+ 		if ((get_timespec64(&tstimes[0], &utimes[0]) ||
+-			get_timespec64(&tstimes[1], &utimes[1])))
++		     get_timespec64(&tstimes[1], &utimes[1])))
++			return -EFAULT;
++		if ((flags & AT_UTIME_PTIME) &&
++		    get_timespec64(&tstimes[2], &utimes[2]))
+ 			return -EFAULT;
+ 
+ 		/* Nothing to do, we must not even check the path.  */
+ 		if (tstimes[0].tv_nsec == UTIME_OMIT &&
+-		    tstimes[1].tv_nsec == UTIME_OMIT)
++		    tstimes[1].tv_nsec == UTIME_OMIT &&
++		    (!(flags & AT_UTIME_PTIME) ||
++		     tstimes[2].tv_nsec == UTIME_OMIT))
+ 			return 0;
+ 	}
+ 
+@@ -247,14 +268,23 @@ SYSCALL_DEFINE2(utime32, const char __user *, filename,
+ 
+ SYSCALL_DEFINE4(utimensat_time32, unsigned int, dfd, const char __user *, filename, struct old_timespec32 __user *, t, int, flags)
+ {
+-	struct timespec64 tv[2];
++	struct timespec64 tv[3];
++
++	if ((flags & AT_UTIME_PTIME) && !t)
++		return -EINVAL;
+ 
+-	if  (t) {
++	if (t) {
+ 		if (get_old_timespec32(&tv[0], &t[0]) ||
+ 		    get_old_timespec32(&tv[1], &t[1]))
+ 			return -EFAULT;
++		if ((flags & AT_UTIME_PTIME) &&
++		    get_old_timespec32(&tv[2], &t[2]))
++			return -EFAULT;
+ 
+-		if (tv[0].tv_nsec == UTIME_OMIT && tv[1].tv_nsec == UTIME_OMIT)
++		if (tv[0].tv_nsec == UTIME_OMIT &&
++		    tv[1].tv_nsec == UTIME_OMIT &&
++		    (!(flags & AT_UTIME_PTIME) ||
++		     tv[2].tv_nsec == UTIME_OMIT))
+ 			return 0;
+ 	}
+ 	return do_utimes(dfd, filename, t ? tv : NULL, flags);
+diff --git a/include/linux/fs.h b/include/linux/fs.h
+index a01621fa6..07719e216 100644
+--- a/include/linux/fs.h
++++ b/include/linux/fs.h
+@@ -239,6 +239,8 @@ typedef int (dio_iodone_t)(struct kiocb *iocb, loff_t offset,
+ #define ATTR_TIMES_SET	(1 << 16)
+ #define ATTR_TOUCH	(1 << 17)
+ #define ATTR_DELEG	(1 << 18) /* Delegated attrs. Don't break write delegations */
++#define ATTR_PTIME	(1 << 19) /* Set provenance time */
++#define ATTR_PTIME_SET	(1 << 20) /* Set provenance time to specific value */
+ 
+ /*
+  * Whiteout is represented by a char device.  The following constants define the
+@@ -283,6 +285,7 @@ struct iattr {
+ 	struct timespec64 ia_atime;
+ 	struct timespec64 ia_mtime;
+ 	struct timespec64 ia_ctime;
++	struct timespec64 ia_ptime;
+ 
+ 	/*
+ 	 * Not an attribute, but an auxiliary info for filesystems wanting to
+@@ -1814,7 +1817,7 @@ int vfs_mkobj(struct dentry *, umode_t,
+ 
+ int vfs_fchown(struct file *file, uid_t user, gid_t group);
+ int vfs_fchmod(struct file *file, umode_t mode);
+-int vfs_utimes(const struct path *path, struct timespec64 *times);
++int vfs_utimes(const struct path *path, struct timespec64 *times, int flags);
+ 
+ #ifdef CONFIG_COMPAT
+ extern long compat_ptr_ioctl(struct file *file, unsigned int cmd,
+diff --git a/include/linux/stat.h b/include/linux/stat.h
+index e3d00e7bb..52272000c 100644
+--- a/include/linux/stat.h
++++ b/include/linux/stat.h
+@@ -48,6 +48,7 @@ struct kstat {
+ 	struct timespec64 mtime;
+ 	struct timespec64 ctime;
+ 	struct timespec64 btime;			/* File creation time */
++	struct timespec64 ptime;			/* Provenance time */
+ 	u64		blocks;
+ 	u64		mnt_id;
+ 	u64		change_cookie;
+diff --git a/include/uapi/linux/fcntl.h b/include/uapi/linux/fcntl.h
+index aadfbf6e0..f80ce0295 100644
+--- a/include/uapi/linux/fcntl.h
++++ b/include/uapi/linux/fcntl.h
+@@ -190,4 +190,7 @@ struct delegation {
+ #define AT_EXECVE_CHECK		0x10000	/* Only perform a check if execution
+ 					   would be allowed. */
+ 
++/* Flag for utimensat(2): times[2] carries provenance time */
++#define AT_UTIME_PTIME		0x20000
++
+ #endif /* _UAPI_LINUX_FCNTL_H */
+diff --git a/include/uapi/linux/stat.h b/include/uapi/linux/stat.h
+index 1686861aa..0c8db3715 100644
+--- a/include/uapi/linux/stat.h
++++ b/include/uapi/linux/stat.h
+@@ -187,7 +187,8 @@ struct statx {
+ 	__u32	__spare2[1];
+ 
+ 	/* 0xc0 */
+-	__u64	__spare3[8];	/* Spare space for future expansion */
++	struct statx_timestamp	stx_ptime;	/* File provenance time */
++	__u64	__spare3[6];		/* Spare space for future expansion */
+ 
+ 	/* 0x100 */
+ };
+@@ -219,6 +220,7 @@ struct statx {
+ #define STATX_SUBVOL		0x00008000U	/* Want/got stx_subvol */
+ #define STATX_WRITE_ATOMIC	0x00010000U	/* Want/got atomic_write_* fields */
+ #define STATX_DIO_READ_ALIGN	0x00020000U	/* Want/got dio read alignment info */
++#define STATX_PTIME		0x00040000U	/* Want/got stx_ptime */
+ 
+ #define STATX__RESERVED		0x80000000U	/* Reserved for future struct statx expansion */
+ 
+diff --git a/init/initramfs.c b/init/initramfs.c
+index 6ddbfb17f..e066b1fee 100644
+--- a/init/initramfs.c
++++ b/init/initramfs.c
+@@ -139,7 +139,7 @@ static void __init do_utime(char *filename, time64_t mtime)
+ static void __init do_utime_path(const struct path *path, time64_t mtime)
+ {
+ 	struct timespec64 t[2] = { { .tv_sec = mtime }, { .tv_sec = mtime } };
+-	vfs_utimes(path, t);
++	vfs_utimes(path, t, 0);
+ }
+ 
+ static __initdata LIST_HEAD(dir_list);
+-- 
+2.53.0
+
+From e6222d342be8175052ee8993daec2b00e8275457 Mon Sep 17 00:00:00 2001
+From: Sean Smith <DefendTheDisabled@gmail.com>
+Date: Sun, 5 Apr 2026 01:50:54 -0500
+Subject: [PATCH 2/6] btrfs: add provenance time (ptime) support
+
+Store ptime as a dedicated field in btrfs_inode_item reserved space:
+struct btrfs_timespec (12 bytes) + __le32 pad (4 bytes) = 16 bytes,
+consuming 2 of 4 reserved __le64 slots, leaving 2 free.
+
+In-memory: i_ptime_sec/i_ptime_nsec in struct btrfs_inode.
+Persistence: delayed-inode read/write path (the primary persistence
+path for normal inodes, not fill_inode_item).
+Tree-log: ptime written to log tree for fsync crash recovery.
+New inode: initialized to zero (ptime unset).
+
+Getattr reports ptime only when non-zero (distinguishes unset from
+supported-but-zero). Setattr accepts ATTR_PTIME and sets
+BTRFS_FEATURE_COMPAT_RO_PTIME - old kernels see unknown compat_ro
+bit and refuse RW mount, protecting ptime data.
+
+Rename-over preservation: when rename(source, target) replaces an
+existing regular file, if source has ptime=0 and target has ptime
+set, inherit target ptime to source. Guards: S_ISREG both sides,
+nlink==1, not RENAME_EXCHANGE/WHITEOUT. Atomic with rename
+transaction. Enables atomic-save survival (write-temp + rename).
+
+Signed-off-by: Sean Smith <DefendTheDisabled@gmail.com>
+---
+ fs/btrfs/btrfs_inode.h          |  4 ++++
+ fs/btrfs/delayed-inode.c        |  4 ++++
+ fs/btrfs/fs.h                   |  3 ++-
+ fs/btrfs/inode.c                | 42 +++++++++++++++++++++++++++++++++
+ fs/btrfs/tree-log.c             |  2 ++
+ include/uapi/linux/btrfs.h      |  1 +
+ include/uapi/linux/btrfs_tree.h |  4 +++-
+ 7 files changed, 58 insertions(+), 2 deletions(-)
+
+diff --git a/fs/btrfs/btrfs_inode.h b/fs/btrfs/btrfs_inode.h
+index 73602ee8d..bac92f766 100644
+--- a/fs/btrfs/btrfs_inode.h
++++ b/fs/btrfs/btrfs_inode.h
+@@ -334,6 +334,10 @@ struct btrfs_inode {
+ 	u64 i_otime_sec;
+ 	u32 i_otime_nsec;
+ 
++	/* Provenance time - original creation date of file content. */
++	u64 i_ptime_sec;
++	u32 i_ptime_nsec;
++
+ 	/* Hook into fs_info->delayed_iputs */
+ 	struct list_head delayed_iput;
+ 
+diff --git a/fs/btrfs/delayed-inode.c b/fs/btrfs/delayed-inode.c
+index 7e3d294a6..649de7c29 100644
+--- a/fs/btrfs/delayed-inode.c
++++ b/fs/btrfs/delayed-inode.c
+@@ -1887,6 +1887,8 @@ static void fill_stack_inode_item(struct btrfs_trans_handle *trans,
+ 
+ 	btrfs_set_stack_timespec_sec(&inode_item->otime, inode->i_otime_sec);
+ 	btrfs_set_stack_timespec_nsec(&inode_item->otime, inode->i_otime_nsec);
++	btrfs_set_stack_timespec_sec(&inode_item->ptime, inode->i_ptime_sec);
++	btrfs_set_stack_timespec_nsec(&inode_item->ptime, inode->i_ptime_nsec);
+ }
+ 
+ int btrfs_fill_inode(struct btrfs_inode *inode, u32 *rdev)
+@@ -1935,6 +1937,8 @@ int btrfs_fill_inode(struct btrfs_inode *inode, u32 *rdev)
+ 
+ 	inode->i_otime_sec = btrfs_stack_timespec_sec(&inode_item->otime);
+ 	inode->i_otime_nsec = btrfs_stack_timespec_nsec(&inode_item->otime);
++	inode->i_ptime_sec = btrfs_stack_timespec_sec(&inode_item->ptime);
++	inode->i_ptime_nsec = btrfs_stack_timespec_nsec(&inode_item->ptime);
+ 
+ 	vfs_inode->i_generation = inode->generation;
+ 	if (S_ISDIR(vfs_inode->i_mode))
+diff --git a/fs/btrfs/fs.h b/fs/btrfs/fs.h
+index 8ffbc40eb..7c8105ecf 100644
+--- a/fs/btrfs/fs.h
++++ b/fs/btrfs/fs.h
+@@ -284,7 +284,8 @@ enum {
+ 	(BTRFS_FEATURE_COMPAT_RO_FREE_SPACE_TREE |	\
+ 	 BTRFS_FEATURE_COMPAT_RO_FREE_SPACE_TREE_VALID | \
+ 	 BTRFS_FEATURE_COMPAT_RO_VERITY |		\
+-	 BTRFS_FEATURE_COMPAT_RO_BLOCK_GROUP_TREE)
++	 BTRFS_FEATURE_COMPAT_RO_BLOCK_GROUP_TREE | \
++	 BTRFS_FEATURE_COMPAT_RO_PTIME)
+ 
+ #define BTRFS_FEATURE_COMPAT_RO_SAFE_SET	0ULL
+ #define BTRFS_FEATURE_COMPAT_RO_SAFE_CLEAR	0ULL
+diff --git a/fs/btrfs/inode.c b/fs/btrfs/inode.c
+index 13f1f3b52..dce80561a 100644
+--- a/fs/btrfs/inode.c
++++ b/fs/btrfs/inode.c
+@@ -4029,6 +4029,8 @@ static int btrfs_read_locked_inode(struct btrfs_inode *inode, struct btrfs_path
+ 
+ 	inode->i_otime_sec = btrfs_timespec_sec(leaf, &inode_item->otime);
+ 	inode->i_otime_nsec = btrfs_timespec_nsec(leaf, &inode_item->otime);
++	inode->i_ptime_sec = btrfs_timespec_sec(leaf, &inode_item->ptime);
++	inode->i_ptime_nsec = btrfs_timespec_nsec(leaf, &inode_item->ptime);
+ 
+ 	inode_set_bytes(vfs_inode, btrfs_inode_nbytes(leaf, inode_item));
+ 	inode->generation = btrfs_inode_generation(leaf, inode_item);
+@@ -4220,6 +4222,8 @@ static void fill_inode_item(struct btrfs_trans_handle *trans,
+ 
+ 	btrfs_set_timespec_sec(leaf, &item->otime, BTRFS_I(inode)->i_otime_sec);
+ 	btrfs_set_timespec_nsec(leaf, &item->otime, BTRFS_I(inode)->i_otime_nsec);
++	btrfs_set_timespec_sec(leaf, &item->ptime, BTRFS_I(inode)->i_ptime_sec);
++	btrfs_set_timespec_nsec(leaf, &item->ptime, BTRFS_I(inode)->i_ptime_nsec);
+ 
+ 	btrfs_set_inode_nbytes(leaf, item, inode_get_bytes(inode));
+ 	btrfs_set_inode_generation(leaf, item, BTRFS_I(inode)->generation);
+@@ -5424,6 +5428,12 @@ static int btrfs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
+ 	}
+ 
+ 	if (attr->ia_valid) {
++		if (attr->ia_valid & ATTR_PTIME) {
++			BTRFS_I(inode)->i_ptime_sec = attr->ia_ptime.tv_sec;
++			BTRFS_I(inode)->i_ptime_nsec = attr->ia_ptime.tv_nsec;
++			btrfs_set_fs_compat_ro(BTRFS_I(inode)->root->fs_info, PTIME);
++		}
++
+ 		setattr_copy(idmap, inode, attr);
+ 		inode_inc_iversion(inode);
+ 		ret = btrfs_dirty_inode(BTRFS_I(inode));
+@@ -8007,6 +8017,8 @@ struct inode *btrfs_alloc_inode(struct super_block *sb)
+ 
+ 	ei->i_otime_sec = 0;
+ 	ei->i_otime_nsec = 0;
++	ei->i_ptime_sec = 0;
++	ei->i_ptime_nsec = 0;
+ 
+ 	inode = &ei->vfs_inode;
+ 	btrfs_extent_map_tree_init(&ei->extent_tree);
+@@ -8159,6 +8171,14 @@ static int btrfs_getattr(struct mnt_idmap *idmap,
+ 	u32 bi_ro_flags = BTRFS_I(inode)->ro_flags;
+ 
+ 	stat->result_mask |= STATX_BTIME;
++	if (request_mask & STATX_PTIME) {
++		if (BTRFS_I(inode)->i_ptime_sec ||
++		    BTRFS_I(inode)->i_ptime_nsec) {
++			stat->ptime.tv_sec = BTRFS_I(inode)->i_ptime_sec;
++			stat->ptime.tv_nsec = BTRFS_I(inode)->i_ptime_nsec;
++			stat->result_mask |= STATX_PTIME;
++		}
++	}
+ 	stat->btime.tv_sec = BTRFS_I(inode)->i_otime_sec;
+ 	stat->btime.tv_nsec = BTRFS_I(inode)->i_otime_nsec;
+ 	if (bi_flags & BTRFS_INODE_APPEND)
+@@ -8675,6 +8695,28 @@ static int btrfs_rename(struct mnt_idmap *idmap,
+ 			btrfs_abort_transaction(trans, ret);
+ 			goto out_fail;
+ 		}
++		/*
++		 * ptime rename-over preservation: if a file with no ptime
++		 * is being renamed over a file that has ptime (the atomic
++		 * save pattern: write-to-temp + rename over original),
++		 * inherit the target's ptime so provenance survives.
++		 */
++		if (new_inode && S_ISREG(old_inode->i_mode) &&
++		    S_ISREG(new_inode->i_mode) && old_inode->i_nlink == 1 &&
++		    !(flags & (RENAME_EXCHANGE | RENAME_WHITEOUT))) {
++			struct btrfs_inode *old_bi = BTRFS_I(old_inode);
++			struct btrfs_inode *new_bi = BTRFS_I(new_inode);
++			if (!old_bi->i_ptime_sec && !old_bi->i_ptime_nsec &&
++			    (new_bi->i_ptime_sec || new_bi->i_ptime_nsec)) {
++				old_bi->i_ptime_sec = new_bi->i_ptime_sec;
++				old_bi->i_ptime_nsec = new_bi->i_ptime_nsec;
++			}
++		}
++		/* Note: if rename fails below, ptime mutation is harmless —
++		 * the source file keeps its previous ptime=0 semantics since
++		 * the rename didn't complete. The in-memory value will be
++		 * overwritten on next inode read from disk. */
++
+ 		ret = btrfs_update_inode(trans, BTRFS_I(old_inode));
+ 		if (unlikely(ret)) {
+ 			btrfs_abort_transaction(trans, ret);
+diff --git a/fs/btrfs/tree-log.c b/fs/btrfs/tree-log.c
+index 6c40f48cc..7ed09af22 100644
+--- a/fs/btrfs/tree-log.c
++++ b/fs/btrfs/tree-log.c
+@@ -4640,6 +4640,8 @@ static void fill_inode_item(struct btrfs_trans_handle *trans,
+ 
+ 	btrfs_set_timespec_sec(leaf, &item->otime, BTRFS_I(inode)->i_otime_sec);
+ 	btrfs_set_timespec_nsec(leaf, &item->otime, BTRFS_I(inode)->i_otime_nsec);
++	btrfs_set_timespec_sec(leaf, &item->ptime, BTRFS_I(inode)->i_ptime_sec);
++	btrfs_set_timespec_nsec(leaf, &item->ptime, BTRFS_I(inode)->i_ptime_nsec);
+ 
+ 	/*
+ 	 * We do not need to set the nbytes field, in fact during a fast fsync
+diff --git a/include/uapi/linux/btrfs.h b/include/uapi/linux/btrfs.h
+index e8fd92789..d2c542425 100644
+--- a/include/uapi/linux/btrfs.h
++++ b/include/uapi/linux/btrfs.h
+@@ -313,6 +313,7 @@ struct btrfs_ioctl_fs_info_args {
+  * reducing mount time for large filesystem due to better locality.
+  */
+ #define BTRFS_FEATURE_COMPAT_RO_BLOCK_GROUP_TREE	(1ULL << 3)
++#define BTRFS_FEATURE_COMPAT_RO_PTIME			(1ULL << 4)
+ 
+ #define BTRFS_FEATURE_INCOMPAT_MIXED_BACKREF	(1ULL << 0)
+ #define BTRFS_FEATURE_INCOMPAT_DEFAULT_SUBVOL	(1ULL << 1)
+diff --git a/include/uapi/linux/btrfs_tree.h b/include/uapi/linux/btrfs_tree.h
+index fc29d2738..719c00363 100644
+--- a/include/uapi/linux/btrfs_tree.h
++++ b/include/uapi/linux/btrfs_tree.h
+@@ -890,7 +890,9 @@ struct btrfs_inode_item {
+ 	 * a little future expansion, for more than this we can
+ 	 * just grow the inode item and version it
+ 	 */
+-	__le64 reserved[4];
++	struct btrfs_timespec ptime;
++	__le32 __reserved_pad;
++	__le64 reserved[2];
+ 	struct btrfs_timespec atime;
+ 	struct btrfs_timespec ctime;
+ 	struct btrfs_timespec mtime;
+-- 
+2.53.0
+
+From 2e56591a7e0e9175679da36763b2e64b8dfb54a0 Mon Sep 17 00:00:00 2001
+From: Sean Smith <DefendTheDisabled@gmail.com>
+Date: Sun, 5 Apr 2026 01:50:54 -0500
+Subject: [PATCH 3/6] ntfs3: map ptime to NTFS creation time with rename-over
+
+Map ptime to the NTFS Date Created field in $STANDARD_INFORMATION.
+This is a mapped-ptime implementation: setting ptime overwrites the
+creation time. Justified because Windows treats NTFS creation time
+as mutable via SetFileTime() - it was never truly immutable.
+
+Getattr: report NTFS creation time as ptime.
+Setattr: write ptime to NTFS creation time via frecord cr_time path.
+Rename-over: save target creation time before unlink, restore to
+  source after rename. Replicates Windows behavior where creation
+  time survives application atomic saves.
+
+Round-trip: NTFS Date Created -> Btrfs ptime -> NTFS Date Created
+preserves the original creation date through cross-FS copies.
+
+Signed-off-by: Sean Smith <DefendTheDisabled@gmail.com>
+---
+ fs/ntfs3/file.c    | 13 +++++++++++++
+ fs/ntfs3/frecord.c |  8 ++++++++
+ fs/ntfs3/namei.c   | 14 ++++++++++++++
+ 3 files changed, 35 insertions(+)
+
+diff --git a/fs/ntfs3/file.c b/fs/ntfs3/file.c
+index 13d014b87..8688a48b1 100644
+--- a/fs/ntfs3/file.c
++++ b/fs/ntfs3/file.c
+@@ -161,6 +161,13 @@ int ntfs_getattr(struct mnt_idmap *idmap, const struct path *path,
+ 
+ 	stat->result_mask |= STATX_BTIME;
+ 	stat->btime = ni->i_crtime;
++
++	/* Map NTFS creation time to ptime (provenance time) */
++	if (request_mask & STATX_PTIME) {
++		stat->ptime = ni->i_crtime;
++		stat->result_mask |= STATX_PTIME;
++	}
++
+ 	stat->blksize = ni->mi.sbi->cluster_size; /* 512, 1K, ..., 2M */
+ 
+ 	if (inode->i_flags & S_IMMUTABLE)
+@@ -857,6 +864,12 @@ int ntfs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
+ 		i_size_write(inode, newsize);
+ 	}
+ 
++	/* Accept ptime and store as NTFS creation time */
++	if (ia_valid & ATTR_PTIME) {
++		ni->i_crtime = attr->ia_ptime;
++		ni->ni_flags |= NI_FLAG_UPDATE_PARENT;
++	}
++
+ 	setattr_copy(idmap, inode, attr);
+ 
+ 	if (mode != inode->i_mode) {
+diff --git a/fs/ntfs3/frecord.c b/fs/ntfs3/frecord.c
+index d5bbd47e1..b164b2f50 100644
+--- a/fs/ntfs3/frecord.c
++++ b/fs/ntfs3/frecord.c
+@@ -3197,6 +3197,14 @@ int ni_write_inode(struct inode *inode, int sync, const char *hint)
+ 			modified = true;
+ 		}
+ 
++		/* Write creation time (ptime maps to NTFS cr_time) */
++		ts = ni->i_crtime;
++		dup.cr_time = kernel2nt(&ts);
++		if (std->cr_time != dup.cr_time) {
++			std->cr_time = dup.cr_time;
++			modified = true;
++		}
++
+ 		dup.fa = ni->std_fa;
+ 		if (std->fa != dup.fa) {
+ 			std->fa = dup.fa;
+diff --git a/fs/ntfs3/namei.c b/fs/ntfs3/namei.c
+index b2af8f695..40d06884f 100644
+--- a/fs/ntfs3/namei.c
++++ b/fs/ntfs3/namei.c
+@@ -292,6 +292,16 @@ static int ntfs_rename(struct mnt_idmap *idmap, struct inode *dir,
+ 		return -EINVAL;
+ 	}
+ 
++	/* ptime rename-over: save target creation time before unlink */
++	struct timespec64 saved_crtime = {};
++	bool inherit_crtime = false;
++
++	if (new_inode && S_ISREG(inode->i_mode) &&
++	    S_ISREG(new_inode->i_mode) && inode->i_nlink == 1) {
++		saved_crtime = ntfs_i(new_inode)->i_crtime;
++		inherit_crtime = true;
++	}
++
+ 	if (new_inode) {
+ 		/* Target name exists. Unlink it. */
+ 		dget(new_dentry);
+@@ -330,6 +340,10 @@ static int ntfs_rename(struct mnt_idmap *idmap, struct inode *dir,
+ 
+ 	err = ni_rename(dir_ni, new_dir_ni, ni, de, new_de);
+ 	if (!err) {
++		/* ptime rename-over: inherit target creation time */
++		if (inherit_crtime)
++			ni->i_crtime = saved_crtime;
++
+ 		simple_rename_timestamp(dir, dentry, new_dir, new_dentry);
+ 		mark_inode_dirty(inode);
+ 		mark_inode_dirty(dir);
+-- 
+2.53.0
+
+From 27c11b25f2e8be850af2d634abdbb3347a27df7e Mon Sep 17 00:00:00 2001
+From: Sean Smith <DefendTheDisabled@gmail.com>
+Date: Sun, 5 Apr 2026 01:50:54 -0500
+Subject: [PATCH 4/6] ext4: add dedicated ptime field alongside i_crtime
+
+Add i_ptime (__le32) and i_ptime_extra (__le32) to the ext4 on-disk
+inode structure after i_projid. Total: 8 bytes in the extended inode
+area. i_crtime remains untouched as immutable birth time.
+
+This is a native-ptime implementation: ptime and btime are separate
+fields. On 256-byte inodes (modern default), both fit easily. On
+128-byte inodes, ptime is silently unavailable (same graceful
+degradation as i_crtime via EXT4_FITS_IN_INODE).
+
+Uses existing EXT4_EINODE_GET_XTIME/SET_XTIME macros for read/write.
+Rename-over: when a file with ptime=0 replaces a file with ptime set,
+inherit target ptime (same zero-sentinel logic as Btrfs).
+
+Signed-off-by: Sean Smith <DefendTheDisabled@gmail.com>
+---
+ fs/ext4/ext4.h  |  3 +++
+ fs/ext4/inode.c | 14 ++++++++++++++
+ fs/ext4/namei.c | 13 +++++++++++++
+ 3 files changed, 30 insertions(+)
+
+diff --git a/fs/ext4/ext4.h b/fs/ext4/ext4.h
+index f1c476303..5c2812637 100644
+--- a/fs/ext4/ext4.h
++++ b/fs/ext4/ext4.h
+@@ -860,6 +860,8 @@ struct ext4_inode {
+ 	__le32  i_crtime_extra; /* extra FileCreationtime (nsec << 2 | epoch) */
+ 	__le32  i_version_hi;	/* high 32 bits for 64-bit version */
+ 	__le32	i_projid;	/* Project ID */
++	__le32	i_ptime;		/* Provenance time */
++	__le32	i_ptime_extra;	/* extra Provenance time (nsec << 2 | epoch) */
+ };
+ 
+ #define EXT4_EPOCH_BITS 2
+@@ -1136,6 +1138,7 @@ struct ext4_inode_info {
+ 	 * struct timespec64 i_{a,c,m}time in the generic inode.
+ 	 */
+ 	struct timespec64 i_crtime;
++	struct timespec64 i_ptime;
+ 
+ 	/* mballoc */
+ 	atomic_t i_prealloc_active;
+diff --git a/fs/ext4/inode.c b/fs/ext4/inode.c
+index 625cfbf61..15b6b6dc6 100644
+--- a/fs/ext4/inode.c
++++ b/fs/ext4/inode.c
+@@ -4753,6 +4753,7 @@ static int ext4_fill_raw_inode(struct inode *inode, struct ext4_inode *raw_inode
+ 	EXT4_INODE_SET_MTIME(inode, raw_inode);
+ 	EXT4_INODE_SET_ATIME(inode, raw_inode);
+ 	EXT4_EINODE_SET_XTIME(i_crtime, ei, raw_inode);
++	EXT4_EINODE_SET_XTIME(i_ptime, ei, raw_inode);
+ 
+ 	raw_inode->i_dtime = cpu_to_le32(ei->i_dtime);
+ 	raw_inode->i_flags = cpu_to_le32(ei->i_flags & 0xFFFFFFFF);
+@@ -5409,6 +5410,7 @@ struct inode *__ext4_iget(struct super_block *sb, unsigned long ino,
+ 	EXT4_INODE_GET_ATIME(inode, raw_inode);
+ 	EXT4_INODE_GET_MTIME(inode, raw_inode);
+ 	EXT4_EINODE_GET_XTIME(i_crtime, ei, raw_inode);
++	EXT4_EINODE_GET_XTIME(i_ptime, ei, raw_inode);
+ 
+ 	if (likely(!test_opt2(inode->i_sb, HURD_COMPAT))) {
+ 		u64 ivers = le32_to_cpu(raw_inode->i_disk_version);
+@@ -6061,6 +6063,9 @@ int ext4_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
+ 	if (!error) {
+ 		if (inc_ivers)
+ 			inode_inc_iversion(inode);
++		if (attr->ia_valid & ATTR_PTIME)
++			EXT4_I(inode)->i_ptime = attr->ia_ptime;
++
+ 		setattr_copy(idmap, inode, attr);
+ 		mark_inode_dirty(inode);
+ 	}
+@@ -6114,6 +6119,15 @@ int ext4_getattr(struct mnt_idmap *idmap, const struct path *path,
+ 		stat->btime.tv_nsec = ei->i_crtime.tv_nsec;
+ 	}
+ 
++	/* Report ptime from dedicated field, not crtime */
++	if ((request_mask & STATX_PTIME) &&
++	    EXT4_FITS_IN_INODE(raw_inode, ei, i_ptime) &&
++	    (ei->i_ptime.tv_sec || ei->i_ptime.tv_nsec)) {
++		stat->result_mask |= STATX_PTIME;
++		stat->ptime.tv_sec = ei->i_ptime.tv_sec;
++		stat->ptime.tv_nsec = ei->i_ptime.tv_nsec;
++	}
++
+ 	/*
+ 	 * Return the DIO alignment restrictions if requested.  We only return
+ 	 * this information when requested, since on encrypted files it might
+diff --git a/fs/ext4/namei.c b/fs/ext4/namei.c
+index c4b5e252a..1bfe4df24 100644
+--- a/fs/ext4/namei.c
++++ b/fs/ext4/namei.c
+@@ -3942,6 +3942,19 @@ static int ext4_rename(struct mnt_idmap *idmap, struct inode *old_dir,
+ 	 * rename.
+ 	 */
+ 	inode_set_ctime_current(old.inode);
++
++	/* ptime rename-over: preserve ptime across atomic saves */
++	if (new.inode && S_ISREG(old.inode->i_mode) &&
++	    S_ISREG(new.inode->i_mode) && old.inode->i_nlink == 1 &&
++	    !(flags & RENAME_WHITEOUT)) {
++		struct ext4_inode_info *old_ei = EXT4_I(old.inode);
++		struct ext4_inode_info *new_ei = EXT4_I(new.inode);
++
++		if (!old_ei->i_ptime.tv_sec && !old_ei->i_ptime.tv_nsec &&
++		    (new_ei->i_ptime.tv_sec || new_ei->i_ptime.tv_nsec))
++			old_ei->i_ptime = new_ei->i_ptime;
++	}
++
+ 	retval = ext4_mark_inode_dirty(handle, old.inode);
+ 	if (unlikely(retval))
+ 		goto end_rename;
+-- 
+2.53.0
+
+From bba49247cab70eb6d60d59e5110be5fff275400c Mon Sep 17 00:00:00 2001
+From: Sean Smith <DefendTheDisabled@gmail.com>
+Date: Sun, 5 Apr 2026 01:50:55 -0500
+Subject: [PATCH 5/6] fat: map ptime to FAT creation time with rename-over
+
+Map ptime to the FAT/VFAT creation time field. Only active on VFAT
+(long filename) mounts since plain FAT12/FAT16 lack creation time.
+FAT32 creation time has 2-second precision.
+
+Getattr: report creation time as ptime (VFAT only, via isvfat check).
+Setattr: write ptime to i_crtime.
+Rename-over: save target creation time before detach, restore to
+  source after attach. Preserves creation time across atomic saves.
+
+Signed-off-by: Sean Smith <DefendTheDisabled@gmail.com>
+---
+ fs/fat/file.c       |  6 ++++++
+ fs/fat/namei_vfat.c | 20 ++++++++++++++++++--
+ 2 files changed, 24 insertions(+), 2 deletions(-)
+
+diff --git a/fs/fat/file.c b/fs/fat/file.c
+index 4fc49a614..9d1fcc554 100644
+--- a/fs/fat/file.c
++++ b/fs/fat/file.c
+@@ -413,6 +413,10 @@ int fat_getattr(struct mnt_idmap *idmap, const struct path *path,
+ 		stat->result_mask |= STATX_BTIME;
+ 		stat->btime = MSDOS_I(inode)->i_crtime;
+ 	}
++	if (sbi->options.isvfat && (request_mask & STATX_PTIME)) {
++		stat->result_mask |= STATX_PTIME;
++		stat->ptime = MSDOS_I(inode)->i_crtime;
++	}
+ 
+ 	return 0;
+ }
+@@ -564,6 +568,8 @@ int fat_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
+ 		fat_truncate_time(inode, &attr->ia_mtime, S_MTIME);
+ 	attr->ia_valid &= ~(ATTR_ATIME|ATTR_CTIME|ATTR_MTIME);
+ 
++	if (attr->ia_valid & ATTR_PTIME)
++		MSDOS_I(inode)->i_crtime = attr->ia_ptime;
+ 	setattr_copy(idmap, inode, attr);
+ 	mark_inode_dirty(inode);
+ out:
+diff --git a/fs/fat/namei_vfat.c b/fs/fat/namei_vfat.c
+index 47ff083cf..f1e2eadf8 100644
+--- a/fs/fat/namei_vfat.c
++++ b/fs/fat/namei_vfat.c
+@@ -975,8 +975,24 @@ static int vfat_rename(struct inode *old_dir, struct dentry *old_dentry,
+ 	}
+ 	inode_inc_iversion(new_dir);
+ 
+-	fat_detach(old_inode);
+-	fat_attach(old_inode, new_i_pos);
++	/* ptime rename-over: save target creation time */
++	{
++		struct timespec64 saved_crtime = {};
++		bool inherit_crtime = false;
++
++		if (new_inode && S_ISREG(old_inode->i_mode) &&
++		    S_ISREG(new_inode->i_mode) && old_inode->i_nlink == 1) {
++			saved_crtime = MSDOS_I(new_inode)->i_crtime;
++			inherit_crtime = true;
++		}
++
++		fat_detach(old_inode);
++		fat_attach(old_inode, new_i_pos);
++
++		if (inherit_crtime)
++			MSDOS_I(old_inode)->i_crtime = saved_crtime;
++	}
++
+ 	err = vfat_sync_ipos(new_dir, old_inode);
+ 	if (err)
+ 		goto error_inode;
+-- 
+2.53.0
+
+From a7c981250c51e6875c439665a564c8e062369cc8 Mon Sep 17 00:00:00 2001
+From: Sean Smith <DefendTheDisabled@gmail.com>
+Date: Sun, 5 Apr 2026 01:50:55 -0500
+Subject: [PATCH 6/6] exfat: map ptime to exFAT creation time with rename-over
+
+Map ptime to the exFAT creation time field. exFAT creation time
+has 10ms precision.
+
+Getattr: report creation time as ptime.
+Setattr: write ptime to i_crtime.
+Rename-over: save target creation time before __exfat_rename, restore
+  after. Preserves creation time across atomic saves.
+
+Signed-off-by: Sean Smith <DefendTheDisabled@gmail.com>
+---
+ fs/btrfs/inode.c |  3 ++-
+ fs/exfat/file.c  |  9 +++++++++
+ fs/exfat/namei.c | 21 ++++++++++++++++++---
+ 3 files changed, 29 insertions(+), 4 deletions(-)
+
+diff --git a/fs/btrfs/inode.c b/fs/btrfs/inode.c
+index dce80561a..918dfd4c5 100644
+--- a/fs/btrfs/inode.c
++++ b/fs/btrfs/inode.c
+@@ -8715,7 +8715,8 @@ static int btrfs_rename(struct mnt_idmap *idmap,
+ 		/* Note: if rename fails below, ptime mutation is harmless —
+ 		 * the source file keeps its previous ptime=0 semantics since
+ 		 * the rename didn't complete. The in-memory value will be
+-		 * overwritten on next inode read from disk. */
++		 * overwritten on next inode read from disk.
++		 */
+ 
+ 		ret = btrfs_update_inode(trans, BTRFS_I(old_inode));
+ 		if (unlikely(ret)) {
+diff --git a/fs/exfat/file.c b/fs/exfat/file.c
+index 536c8078f..b6438bd79 100644
+--- a/fs/exfat/file.c
++++ b/fs/exfat/file.c
+@@ -277,6 +277,11 @@ int exfat_getattr(struct mnt_idmap *idmap, const struct path *path,
+ 	stat->result_mask |= STATX_BTIME;
+ 	stat->btime.tv_sec = ei->i_crtime.tv_sec;
+ 	stat->btime.tv_nsec = ei->i_crtime.tv_nsec;
++	if (request_mask & STATX_PTIME) {
++		stat->result_mask |= STATX_PTIME;
++		stat->ptime.tv_sec = ei->i_crtime.tv_sec;
++		stat->ptime.tv_nsec = ei->i_crtime.tv_nsec;
++	}
+ 	stat->blksize = EXFAT_SB(inode->i_sb)->cluster_size;
+ 	return 0;
+ }
+@@ -337,6 +342,10 @@ int exfat_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
+ 	if (attr->ia_valid & ATTR_SIZE)
+ 		inode_set_mtime_to_ts(inode, inode_set_ctime_current(inode));
+ 
++	if (attr->ia_valid & ATTR_PTIME) {
++		struct exfat_inode_info *exi = EXFAT_I(inode);
++		exi->i_crtime = attr->ia_ptime;
++	}
+ 	setattr_copy(idmap, inode, attr);
+ 	exfat_truncate_inode_atime(inode);
+ 
+diff --git a/fs/exfat/namei.c b/fs/exfat/namei.c
+index dfe957493..9c0b59e00 100644
+--- a/fs/exfat/namei.c
++++ b/fs/exfat/namei.c
+@@ -1262,9 +1262,24 @@ static int exfat_rename(struct mnt_idmap *idmap,
+ 	old_inode = old_dentry->d_inode;
+ 	new_inode = new_dentry->d_inode;
+ 
+-	err = __exfat_rename(old_dir, EXFAT_I(old_inode), new_dir, new_dentry);
+-	if (err)
+-		goto unlock;
++	/* ptime rename-over: save target creation time */
++	{
++		struct timespec64 saved_crtime = {};
++		bool inherit_crtime = false;
++
++		if (new_inode && S_ISREG(old_inode->i_mode) &&
++		    S_ISREG(new_inode->i_mode) && old_inode->i_nlink == 1) {
++			saved_crtime = EXFAT_I(new_inode)->i_crtime;
++			inherit_crtime = true;
++		}
++
++		err = __exfat_rename(old_dir, EXFAT_I(old_inode), new_dir, new_dentry);
++		if (err)
++			goto unlock;
++
++		if (inherit_crtime)
++			EXFAT_I(old_inode)->i_crtime = saved_crtime;
++	}
+ 
+ 	inode_inc_iversion(new_dir);
+ 	simple_rename_timestamp(old_dir, old_dentry, new_dir, new_dentry);
+-- 
+2.53.0
+
