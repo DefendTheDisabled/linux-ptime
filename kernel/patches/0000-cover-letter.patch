@@ -1,9 +1,116 @@
 From a7c981250c51e6875c439665a564c8e062369cc8 Mon Sep 17 00:00:00 2001
 From: Sean Smith <DefendTheDisabled@gmail.com>
 Date: Sun, 5 Apr 2026 01:51:59 -0500
-Subject: [PATCH 0/6] *** SUBJECT HERE ***
+Subject: [RFC PATCH v1 0/6] provenance_time (ptime): a new settable timestamp for cross-filesystem provenance
 
-*** BLURB HERE ***
+This series adds provenance_time (ptime) -- a new settable inode
+timestamp that records when a file's content was first created,
+preserving this date across copies, moves, and application saves.
+
+This is a working implementation of the concept I proposed in my
+RFC in March:
+  https://lore.kernel.org/linux-fsdevel/CAOx6djP4hb-Cd1Zk07SNfFfLc8irjNmbVqq+58h1Whz+h1wSFA@mail.gmail.com/T/#u
+
+MOTIVATION
+
+Linux has no mechanism to preserve original creation dates when
+files move between filesystems. Every copy resets btime to "now."
+For workflows involving document migration (NTFS to Btrfs, between
+ext4 volumes, to USB drives), creation date provenance is lost.
+
+Since the March RFC, I attempted an xattr-based workaround
+(user.provenance_time) and found it structurally unworkable:
+
+  1. Application atomic saves destroy xattrs. Programs that save
+     via write-to-temp + rename() replace the inode, permanently
+     destroying all extended attributes. Only the VFS sees both
+     inodes during rename -- no userspace mechanism can intercept
+     this and copy metadata across.
+
+  2. Every tool in the copy chain must explicitly opt in to xattr
+     preservation. cp requires --preserve=xattr, rsync requires -X,
+     tar requires --xattrs. Each missing flag causes silent data
+     loss. Transparent preservation through arbitrary tool flows
+     is not achievable in userspace.
+
+Atomic saves are the default behavior of mainstream applications
+(LibreOffice, Vim, Kate, etc.).
+
+DESIGN
+
+ptime is a separate timestamp from btime. btime remains immutable
+and forensic ("when was this inode born on this disk"). ptime is
+settable and portable ("when was this content first created").
+
+This resolves the 2019 impasse: Dave Chinner's forensic argument
+for immutable btime is fully respected -- btime is untouched on
+native Linux filesystems. Ted Ts'o's March 2025 concept of a
+settable "crtime" alongside immutable btime is implemented in ext4
+with dedicated i_ptime fields.
+
+Two implementation categories:
+
+  Native (Btrfs, ext4): Dedicated on-disk ptime field. btime
+  remains immutable. Full nanosecond precision.
+
+  Mapped (ntfs3, FAT32/vfat, exFAT): ptime reads/writes the
+  existing creation time field. This matches Windows and macOS
+  behavior, where creation time is already settable via standard
+  APIs. No new on-disk structures needed.
+
+Key VFS capability -- rename-over preservation: when rename()
+overwrites an existing file, the kernel copies ptime from the
+old file to the new file. This fixes the atomic-save xattr
+destruction problem at its root, for every application on
+every supported filesystem.
+
+API
+
+ptime is exposed through existing interfaces with minimal
+additions:
+
+  - statx: STATX_PTIME (0x00040000U) returns ptime in stx_ptime
+  - utimensat: AT_UTIME_PTIME (0x20000) flag with times[2]
+    extension for setting ptime
+  - setattr_prepare: ATTR_PTIME (bit 19) / ATTR_PTIME_SET (bit 20)
+
+The utimensat extension reuses Sandoval's 2019 pattern. For
+upstream, an extensible-struct syscall (utimensat2, following
+the clone3/openat2 convention) may be preferred -- I am open
+to guidance on the API design.
+
+Permissions follow the existing utimensat model: file owner
+or CAP_FOWNER required.
+
+TESTING
+
+This has been running on EndeavourOS (kernel 6.19.11) for daily
+use. Test coverage:
+
+  - 10 xfstests (7 generic VFS + 3 Btrfs-specific): basic
+    set/read, persistence, rename-over, permissions, utime-omit,
+    chmod/truncate survival, snapshots, nlink guards, compat_ro
+
+  - Runtime tests across all 5 filesystems: set/read, rename-over,
+    cp -a preservation, cross-FS copies (Btrfs, ext4, ntfs3,
+    FAT32, exFAT)
+
+KNOWN LIMITATIONS
+
+  - XFS: deferred (separate inode structure analysis needed)
+  - Btrfs send/receive: not yet patched for ptime
+  - glibc utimensat() wrapper: cannot pass ptime; tools use raw
+    syscall()
+  - Btrfs compat_ro: writing ptime sets a compat_ro flag;
+    unpatched kernels refuse RW mount (correct Btrfs behavior)
+
+The userspace ecosystem (patched cp, rsync, tar, KDE Dolphin)
+and xfstests are available at:
+  https://github.com/DefendTheDisabled/linux-ptime
+
+This implementation was developed using AI-assisted tooling for
+code generation, iterative review, and test infrastructure. I am
+responsible for review, testing, and sign-off.
 
 Sean Smith (6):
   vfs: add provenance_time (ptime) infrastructure
@@ -44,4 +151,3 @@ Sean Smith (6):
 
 -- 
 2.53.0
-
