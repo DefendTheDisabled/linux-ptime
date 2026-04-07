@@ -5,7 +5,7 @@
 #
 
 # Check that the running kernel supports ptime (STATX_PTIME via statx,
-# AT_UTIME_PTIME via utimensat).  Uses the TEST filesystem.
+# file_setattr syscall 469).  Uses the TEST filesystem.
 _require_ptime()
 {
 	local testfile=$TEST_DIR/ptime_support_test
@@ -19,7 +19,7 @@ _require_ptime()
 	$ptime_set $testfile 1234567890 0 >> $seqres.full 2>&1
 	if [ $? -ne 0 ]; then
 		rm -f $testfile
-		_notrun "Kernel does not support AT_UTIME_PTIME"
+		_notrun "Kernel does not support file_setattr ptime"
 	fi
 
 	local result=$($ptime_get $testfile 2>>$seqres.full)
@@ -50,7 +50,7 @@ _require_scratch_ptime()
 	$ptime_set $testfile 1234567890 0 >> $seqres.full 2>&1
 	if [ $? -ne 0 ]; then
 		_scratch_unmount
-		_notrun "Kernel does not support AT_UTIME_PTIME"
+		_notrun "Kernel does not support file_setattr ptime"
 	fi
 
 	local result=$($ptime_get $testfile 2>>$seqres.full)

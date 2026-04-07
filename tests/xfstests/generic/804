@@ -4,8 +4,8 @@
 #
 # FS QA Test No. 804
 #
-# Test ptime with UTIME_OMIT for atime/mtime.
-# Setting ptime should not alter atime or mtime.
+# Test ptime via file_setattr does not alter atime/mtime.
+# file_setattr with only ptime fields should not touch atime or mtime.
 #
 . ./common/preamble
 _begin_fstest auto quick ptime
