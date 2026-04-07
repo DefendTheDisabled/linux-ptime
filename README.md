@@ -23,7 +23,7 @@ ptime builds directly on prior kernel work and resolves the semantic impasse:
 
 | Proposal | How ptime relates |
 |----------|-------------------|
-| **Sandoval's AT_UTIME_BTIME (2019)** | ptime uses the same utimensat extension pattern but targets a new field, sidestepping the btime mutability dispute entirely |
+| **Sandoval's AT_UTIME_BTIME (2019)** | ptime addresses the same need (settable creation date) via file_setattr, sidestepping both the btime mutability dispute and the glibc wrapper limitation that blocked Sandoval's utimensat approach |
 | **Ts'o's btime/crtime split (March 2025)** | ext4 ptime implements his concept -- dedicated i_ptime alongside immutable i_crtime. "crtime which *can* be changed by a system call interface." |
 | **Chinner's forensic btime objection (2019)** | ptime is a separate field on native filesystems -- btime remains immutable; no forensic semantics are changed |
 | **Sterba's Btrfs otime / send v2** | ptime infrastructure serves the settable-timestamp need for send/receive |
@@ -57,36 +57,36 @@ This patch was created to solve a concrete problem: preserving document creation
 
 ## API Design
 
-**Setting ptime**: The current implementation extends utimensat() with a third element in the times[] array, gated by the AT_UTIME_PTIME flag (0x20000). Userspace tools use raw syscall() since glibc's utimensat() wrapper only passes two timespec values.
+**Setting ptime**: Uses the file_setattr syscall (469, merged Linux 6.17 by Andrey Albershteyn of Red Hat). ptime fields are added to `struct file_attr` as a VER1 extension (40 bytes). The size-versioned struct is forward/backward compatible — same pattern as clone_args and mount_attr. No glibc wrapper conflicts; tools pass a struct pointer. Suggested by Darrick J. Wong (XFS maintainer) during RFC review.
 
-For upstream, a new extensible-struct syscall (utimensat2, following the clone3/openat2 pattern) is the preferred long-term approach. The utimensat extension is used here to demonstrate and validate the VFS semantics with minimal kernel surface change.
+Internally, the kernel dispatches ptime writes through `notify_change()` (the standard iattr/setattr path), reusing all existing per-filesystem ptime handlers unchanged. The file_setattr syscall validates `fa_ptime_nsec < NSEC_PER_SEC` and `fa_ptime_pad == 0` for safety and forward compatibility.
 
 **Reading ptime**: statx() returns ptime via STATX_PTIME (0x00040000U) in the stx_ptime field.
 
 **Permissions**: Setting ptime requires file ownership or CAP_FOWNER (same model as utimensat for atime/mtime). Tested in xfstests generic/803.
 
-**Unsupported filesystems**: statx() returns 0 for ptime (STATX_PTIME not set in stx_mask). utimensat with AT_UTIME_PTIME returns -EOPNOTSUPP or is silently ignored depending on the filesystem's setattr implementation.
+**Unsupported filesystems**: statx() returns 0 for ptime (STATX_PTIME not set in stx_mask). file_setattr with ptime on unsupported FS may succeed silently (the filesystem's setattr ignores the unknown ATTR_PTIME bit). tmpfs is a known example.
 
 ## What's Implemented
 
-### Kernel Patches (6 commits, 27 files, +239/-26 lines)
+### Kernel Patches (6 commits, 26 files, 648 lines)
 
 | # | Patch | Scope |
 |---|-------|-------|
-| 1 | VFS: ptime infrastructure | ATTR_PTIME (bit 19/20), STATX_PTIME, AT_UTIME_PTIME, ia_ptime in iattr, ptime in kstat, utimensat extension, setattr_prepare |
+| 1 | VFS: ptime infrastructure | ATTR_PTIME (bit 19/20), STATX_PTIME, ia_ptime in iattr, ptime in kstat, file_attr VER1 extension (file_setattr dual-dispatch), setattr_prepare, fileattr.h |
 | 2 | Btrfs: full ptime support | New field in reserved inode space, delayed-inode read/write, tree-log preservation, rename-over (zero-sentinel), new inode init |
 | 3 | ntfs3: mapped ptime | ptime maps to NTFS Date Created ($STANDARD_INFORMATION cr_time), rename-over |
 | 4 | ext4: native ptime | Dedicated i_ptime + i_ptime_extra in extended inode area (alongside immutable i_crtime), rename-over, EXT4_FITS_IN_INODE graceful degradation |
 | 5 | FAT32 (vfat): mapped ptime | ptime maps to FAT creation time, rename-over |
 | 6 | exFAT: mapped ptime | ptime maps to exFAT creation time, rename-over |
 
-Note: The Arch Linux PKGBUILD version is 717 lines / 28 files. The extra file (disk-io.c) contains local-deployment code that clears a Btrfs compat_ro flag on mount to maintain three-kernel boot compatibility. This is excluded from the upstream submission.
+Note: The Arch Linux PKGBUILD version is 648 lines / 26 files. One extra file (disk-io.c) contains local-deployment code that clears a Btrfs compat_ro flag on mount to maintain three-kernel boot compatibility. This is excluded from the upstream submission.
 
 ### Patched Userspace Tools
 
 | Tool | Mechanism |
 |------|-----------|
-| **coreutils** (cp, mv) | Raw statx + utimensat syscalls (x86_64: NR 332, 280) |
+| **coreutils** (cp, mv) | Raw statx (NR 332) + file_setattr (NR 469) syscalls |
 | **KDE KIO** (Dolphin) | Same raw syscalls, Q_OS_LINUX guard |
 | **rsync** (--crtimes) | Added Linux backend to existing macOS/Cygwin crtimes infrastructure |
 | **GNU tar** (--posix) | SCHILY.ptime PAX extended header, create + extract |
@@ -108,7 +108,7 @@ All patched packages protected from rolling updates via IgnorePkg in pacman.conf
 
 ## Test Results
 
-### Multi-Filesystem Runtime Tests (24/24 passing)
+### Multi-Filesystem Runtime Tests (12/12 passing, 4 skipped USB)
 
 Tested on USB drive with 4 partitions (ext4, exFAT, FAT32, Btrfs) plus NVMe root (Btrfs). All operations use patched coreutils:
 
@@ -133,7 +133,7 @@ Tested on USB drive with 4 partitions (ext4, exFAT, FAT32, Btrfs) plus NVMe root
 | generic/801 | Ptime survives unmount/remount | Persistence |
 | generic/802 | Rename-over preserves ptime | Atomic save |
 | generic/803 | Root-only ptime setting | Permissions |
-| generic/804 | Omitting ptime in utimensat | UTIME_OMIT |
+| generic/804 | VER0-only file_setattr (ptime unchanged) | Size versioning |
 | generic/805 | chmod doesn't corrupt ptime | setattr safety |
 | generic/806 | truncate doesn't corrupt ptime | setattr safety |
 | btrfs/350 | Ptime in Btrfs snapshots | Snapshot inheritance |
@@ -153,11 +153,11 @@ Tests run against the 28-file PKGBUILD variant (includes local compat_ro clearin
 | Btrfs send/receive | Not yet patched for ptime | Use rsync --crtimes for remote backup |
 | tar pipe extraction | ptime lost through pipe | Use file-based tar extraction |
 | rsync precision | Seconds-only (no nsec) | Sufficient for provenance dates |
-| glibc utimensat wrapper | Cannot pass ptime | Tools use raw syscall(); utimensat2 or glibc update for upstream |
+| glibc file_attr headers | System headers may not define VER1 struct with ptime fields | Tools use raw buffer+memcpy; glibc update will add native support |
 | tmpfs | No ptime support | tmpfs has no persistent inode storage |
 | Unpatched tools | Silent ptime loss with stock cp/rsync/tar | Deploy patched packages; IgnorePkg protects from rolling updates |
 | NFS/CIFS/FUSE | Not tested | Network and FUSE filesystem support is out of initial scope |
-| Custom kernel maintenance | Periodic rebase | Upstream patch is +239/-26 lines; LTS kernel as fallback |
+| Custom kernel maintenance | Periodic rebase | Upstream patch is 648 lines / 26 files; LTS kernel as fallback |
 
 ## Build Instructions
 
@@ -176,8 +176,8 @@ git am kernel/patches/000[1-6]-*.patch
 pkgctl repo clone --protocol=https linux
 cd linux
 sed -i 's/^pkgbase=linux$/pkgbase=linux-ptime/' PKGBUILD
-cp /path/to/ptime-kernel-v5-full.patch .
-# Add ptime-kernel-v5-full.patch to PKGBUILD source=() array
+cp /path/to/ptime-v6.patch .
+# Add ptime-v6.patch to PKGBUILD source=() array
 # Add 'SKIP' to sha256sums=() array for the new entry
 makepkg -s
 sudo pacman -U linux-ptime-*.pkg.tar.zst linux-ptime-headers-*.pkg.tar.zst
@@ -204,10 +204,10 @@ Kernel 6.19.11, EndeavourOS, AMD Ryzen 9 9900X, Samsung 9100 PRO NVMe.
 ptime-submission/
 +-- README.md
 +-- kernel/
-|   +-- patches/                    # git format-patch v5 (6 commits)
-|   +-- ptime-kernel-v5-full.patch  # Combined patch
+|   +-- patches/                    # git format-patch v6 (6 commits)
+|   +-- ptime-v6.patch              # Combined patch (648 lines, 26 files)
 +-- spec/
-|   +-- kernel-ptime-spec-v5.md     # Technical specification
+|   +-- kernel-ptime-spec-v6.md     # Technical specification
 +-- tests/
 |   +-- xfstests/                   # 10 xfstests (7 generic + 3 btrfs)
 |   +-- ptime-test-suite.sh

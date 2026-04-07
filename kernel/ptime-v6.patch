@@ -1,0 +1,648 @@
+--- /tmp/linux-6.19.11-ref/include/uapi/linux/fs.h	2026-04-02 06:25:57.000000000 -0500
++++ /home/sean/ptime-build/linux/src/linux-6.19.11/include/uapi/linux/fs.h	2026-04-07 09:22:54.711696266 -0500
+@@ -229,10 +229,15 @@
+ 	__u32 fa_nextents;	/* nextents field value (get)   */
+ 	__u32 fa_projid;	/* project identifier (get/set) */
+ 	__u32 fa_cowextsize;	/* CoW extsize field value (get/set) */
++	/* ptime (provenance time) extension — VER1 */
++	__s64 fa_ptime_sec;	/* provenance time: seconds since epoch */
++	__u32 fa_ptime_nsec;	/* provenance time: nanoseconds */
++	__u32 fa_ptime_pad;	/* alignment padding */
+ };
+ 
+ #define FILE_ATTR_SIZE_VER0 24
+-#define FILE_ATTR_SIZE_LATEST FILE_ATTR_SIZE_VER0
++#define FILE_ATTR_SIZE_VER1 (FILE_ATTR_SIZE_VER0 + 16)
++#define FILE_ATTR_SIZE_LATEST FILE_ATTR_SIZE_VER1
+ 
+ /*
+  * Flags for the fsx_xflags field
+--- /tmp/linux-6.19.11-ref/include/uapi/linux/stat.h	2026-04-02 06:25:57.000000000 -0500
++++ /home/sean/ptime-build/linux/src/linux-6.19.11/include/uapi/linux/stat.h	2026-04-05 00:58:03.773708631 -0500
+@@ -187,7 +187,8 @@
+ 	__u32	__spare2[1];
+ 
+ 	/* 0xc0 */
+-	__u64	__spare3[8];	/* Spare space for future expansion */
++	struct statx_timestamp	stx_ptime;	/* File provenance time */
++	__u64	__spare3[6];		/* Spare space for future expansion */
+ 
+ 	/* 0x100 */
+ };
+@@ -219,6 +220,7 @@
+ #define STATX_SUBVOL		0x00008000U	/* Want/got stx_subvol */
+ #define STATX_WRITE_ATOMIC	0x00010000U	/* Want/got atomic_write_* fields */
+ #define STATX_DIO_READ_ALIGN	0x00020000U	/* Want/got dio read alignment info */
++#define STATX_PTIME		0x00040000U	/* Want/got stx_ptime */
+ 
+ #define STATX__RESERVED		0x80000000U	/* Reserved for future struct statx expansion */
+ 
+--- /tmp/linux-6.19.11-ref/include/uapi/linux/btrfs_tree.h	2026-04-02 06:25:57.000000000 -0500
++++ /home/sean/ptime-build/linux/src/linux-6.19.11/include/uapi/linux/btrfs_tree.h	2026-04-05 00:58:03.773868363 -0500
+@@ -890,7 +890,9 @@
+ 	 * a little future expansion, for more than this we can
+ 	 * just grow the inode item and version it
+ 	 */
+-	__le64 reserved[4];
++	struct btrfs_timespec ptime;
++	__le32 __reserved_pad;
++	__le64 reserved[2];
+ 	struct btrfs_timespec atime;
+ 	struct btrfs_timespec ctime;
+ 	struct btrfs_timespec mtime;
+--- /tmp/linux-6.19.11-ref/include/uapi/linux/btrfs.h	2026-04-02 06:25:57.000000000 -0500
++++ /home/sean/ptime-build/linux/src/linux-6.19.11/include/uapi/linux/btrfs.h	2026-04-05 00:58:03.774048735 -0500
+@@ -313,6 +313,7 @@
+  * reducing mount time for large filesystem due to better locality.
+  */
+ #define BTRFS_FEATURE_COMPAT_RO_BLOCK_GROUP_TREE	(1ULL << 3)
++#define BTRFS_FEATURE_COMPAT_RO_PTIME			(1ULL << 4)
+ 
+ #define BTRFS_FEATURE_INCOMPAT_MIXED_BACKREF	(1ULL << 0)
+ #define BTRFS_FEATURE_INCOMPAT_DEFAULT_SUBVOL	(1ULL << 1)
+--- /tmp/linux-6.19.11-ref/include/linux/fileattr.h	2026-04-02 06:25:57.000000000 -0500
++++ /home/sean/ptime-build/linux/src/linux-6.19.11/include/linux/fileattr.h	2026-04-07 09:23:03.989287480 -0500
+@@ -3,6 +3,8 @@
+ #ifndef _LINUX_FILEATTR_H
+ #define _LINUX_FILEATTR_H
+ 
++#include <linux/time64.h>
++
+ /* Flags shared betwen flags/xflags */
+ #define FS_COMMON_FL \
+ 	(FS_SYNC_FL | FS_IMMUTABLE_FL | FS_APPEND_FL | \
+@@ -51,6 +53,9 @@
+ 	/* selectors: */
+ 	bool	flags_valid:1;
+ 	bool	fsx_valid:1;
++	bool	ptime_valid:1;
++	/* provenance time */
++	struct timespec64 ptime;
+ };
+ 
+ int copy_fsxattr_to_user(const struct file_kattr *fa, struct fsxattr __user *ufa);
+--- /tmp/linux-6.19.11-ref/include/linux/fs.h	2026-04-02 06:25:57.000000000 -0500
++++ /home/sean/ptime-build/linux/src/linux-6.19.11/include/linux/fs.h	2026-04-07 09:24:29.674452122 -0500
+@@ -239,6 +239,8 @@
+ #define ATTR_TIMES_SET	(1 << 16)
+ #define ATTR_TOUCH	(1 << 17)
+ #define ATTR_DELEG	(1 << 18) /* Delegated attrs. Don't break write delegations */
++#define ATTR_PTIME	(1 << 19) /* Set provenance time */
++#define ATTR_PTIME_SET	(1 << 20) /* Set provenance time to specific value */
+ 
+ /*
+  * Whiteout is represented by a char device.  The following constants define the
+@@ -283,6 +285,7 @@
+ 	struct timespec64 ia_atime;
+ 	struct timespec64 ia_mtime;
+ 	struct timespec64 ia_ctime;
++	struct timespec64 ia_ptime;
+ 
+ 	/*
+ 	 * Not an attribute, but an auxiliary info for filesystems wanting to
+--- /tmp/linux-6.19.11-ref/include/linux/stat.h	2026-04-02 06:25:57.000000000 -0500
++++ /home/sean/ptime-build/linux/src/linux-6.19.11/include/linux/stat.h	2026-04-05 00:58:03.773657050 -0500
+@@ -48,6 +48,7 @@
+ 	struct timespec64 mtime;
+ 	struct timespec64 ctime;
+ 	struct timespec64 btime;			/* File creation time */
++	struct timespec64 ptime;			/* Provenance time */
+ 	u64		blocks;
+ 	u64		mnt_id;
+ 	u64		change_cookie;
+--- /tmp/linux-6.19.11-ref/fs/file_attr.c	2026-04-02 06:25:57.000000000 -0500
++++ /home/sean/ptime-build/linux/src/linux-6.19.11/fs/file_attr.c	2026-04-07 15:08:55.548765650 -0500
+@@ -148,6 +148,10 @@
+ 	fa->fsx_projid = fattr->fa_projid;
+ 	fa->fsx_cowextsize = fattr->fa_cowextsize;
+ 
++	/* Always copy ptime fields; caller sets ptime_valid based on usize */
++	fa->ptime.tv_sec = fattr->fa_ptime_sec;
++	fa->ptime.tv_nsec = fattr->fa_ptime_nsec;
++
+ 	return 0;
+ }
+ 
+@@ -481,10 +485,58 @@
+ 
+ 	error = mnt_want_write(filepath.mnt);
+ 	if (!error) {
+-		error = vfs_fileattr_set(mnt_idmap(filepath.mnt),
+-					 filepath.dentry, &fa);
+-		if (error == -ENOIOCTLCMD || error == -ENOTTY)
+-			error = -EOPNOTSUPP;
++		/* ptime fields present only if userspace struct is VER1+ */
++		if (usize >= FILE_ATTR_SIZE_VER1) {
++			if (fattr.fa_ptime_pad != 0) {
++				error = -EINVAL;
++				goto drop_write;
++			}
++			if (fattr.fa_ptime_nsec >= 1000000000U) {
++				error = -EINVAL;
++				goto drop_write;
++			}
++			fa.ptime_valid = true;
++		}
++
++		/* Handle ptime via notify_change (iattr/setattr path).
++		 * Lock/unlock inode separately from vfs_fileattr_set below;
++		 * sequential acquisition, never nested — no deadlock risk.
++		 * ptime and xflags are orthogonal; brief TOCTOU gap between
++		 * the two operations is acceptable (same as chmod+chown). */
++		if (fa.ptime_valid) {
++			struct iattr attr = {};
++			struct inode *inode = d_inode(filepath.dentry);
++
++			attr.ia_valid = ATTR_PTIME | ATTR_PTIME_SET;
++			attr.ia_ptime = fa.ptime;
++			inode_lock(inode);
++			error = notify_change(mnt_idmap(filepath.mnt),
++					      filepath.dentry, &attr, NULL);
++			inode_unlock(inode);
++			if (error)
++				goto drop_write;
++		}
++
++		/* Handle file attrs (xflags, extsize, projid, cowextsize).
++		 * Clear ptime from file_kattr — already handled via
++		 * notify_change above; .fileattr_set must not process it. */
++		{
++			bool had_ptime = fa.ptime_valid;
++			fa.ptime_valid = false;
++			fa.ptime = (struct timespec64){};
++
++			if (fattr.fa_xflags || fattr.fa_extsize ||
++			    fattr.fa_projid || fattr.fa_cowextsize) {
++				error = vfs_fileattr_set(mnt_idmap(filepath.mnt),
++							 filepath.dentry, &fa);
++				if (error == -ENOIOCTLCMD || error == -ENOTTY)
++					error = -EOPNOTSUPP;
++			} else if (!had_ptime) {
++				/* No ptime and no file attrs -- nothing to set */
++				error = -EINVAL;
++			}
++		}
++drop_write:
+ 		mnt_drop_write(filepath.mnt);
+ 	}
+ 
+--- /tmp/linux-6.19.11-ref/fs/attr.c	2026-04-02 06:25:57.000000000 -0500
++++ /home/sean/ptime-build/linux/src/linux-6.19.11/fs/attr.c	2026-04-05 00:58:03.774346079 -0500
+@@ -206,7 +206,7 @@
+ 	}
+ 
+ 	/* Check for setting the inode time. */
+-	if (ia_valid & (ATTR_MTIME_SET | ATTR_ATIME_SET | ATTR_TIMES_SET)) {
++	if (ia_valid & (ATTR_MTIME_SET | ATTR_ATIME_SET | ATTR_PTIME_SET | ATTR_TIMES_SET)) {
+ 		if (!inode_owner_or_capable(idmap, inode))
+ 			return -EPERM;
+ 	}
+@@ -466,6 +466,10 @@
+ 		attr->ia_mtime = timestamp_truncate(attr->ia_mtime, inode);
+ 	else
+ 		attr->ia_mtime = now;
++	if (ia_valid & ATTR_PTIME_SET)
++		attr->ia_ptime = timestamp_truncate(attr->ia_ptime, inode);
++	else if (ia_valid & ATTR_PTIME)
++		attr->ia_ptime = now;
+ 
+ 	if (ia_valid & ATTR_KILL_PRIV) {
+ 		error = security_inode_need_killpriv(dentry);
+--- /tmp/linux-6.19.11-ref/fs/stat.c	2026-04-02 06:25:57.000000000 -0500
++++ /home/sean/ptime-build/linux/src/linux-6.19.11/fs/stat.c	2026-04-05 00:58:03.774220287 -0500
+@@ -728,6 +728,8 @@
+ 	tmp.stx_atime.tv_nsec = stat->atime.tv_nsec;
+ 	tmp.stx_btime.tv_sec = stat->btime.tv_sec;
+ 	tmp.stx_btime.tv_nsec = stat->btime.tv_nsec;
++	tmp.stx_ptime.tv_sec = stat->ptime.tv_sec;
++	tmp.stx_ptime.tv_nsec = stat->ptime.tv_nsec;
+ 	tmp.stx_ctime.tv_sec = stat->ctime.tv_sec;
+ 	tmp.stx_ctime.tv_nsec = stat->ctime.tv_nsec;
+ 	tmp.stx_mtime.tv_sec = stat->mtime.tv_sec;
+--- /tmp/linux-6.19.11-ref/fs/btrfs/btrfs_inode.h	2026-04-02 06:25:57.000000000 -0500
++++ /home/sean/ptime-build/linux/src/linux-6.19.11/fs/btrfs/btrfs_inode.h	2026-04-05 00:58:03.776119381 -0500
+@@ -334,6 +334,10 @@
+ 	u64 i_otime_sec;
+ 	u32 i_otime_nsec;
+ 
++	/* Provenance time - original creation date of file content. */
++	u64 i_ptime_sec;
++	u32 i_ptime_nsec;
++
+ 	/* Hook into fs_info->delayed_iputs */
+ 	struct list_head delayed_iput;
+ 
+--- /tmp/linux-6.19.11-ref/fs/btrfs/delayed-inode.c	2026-04-02 06:25:57.000000000 -0500
++++ /home/sean/ptime-build/linux/src/linux-6.19.11/fs/btrfs/delayed-inode.c	2026-04-05 00:58:03.776289533 -0500
+@@ -1887,6 +1887,8 @@
+ 
+ 	btrfs_set_stack_timespec_sec(&inode_item->otime, inode->i_otime_sec);
+ 	btrfs_set_stack_timespec_nsec(&inode_item->otime, inode->i_otime_nsec);
++	btrfs_set_stack_timespec_sec(&inode_item->ptime, inode->i_ptime_sec);
++	btrfs_set_stack_timespec_nsec(&inode_item->ptime, inode->i_ptime_nsec);
+ }
+ 
+ int btrfs_fill_inode(struct btrfs_inode *inode, u32 *rdev)
+@@ -1935,6 +1937,8 @@
+ 
+ 	inode->i_otime_sec = btrfs_stack_timespec_sec(&inode_item->otime);
+ 	inode->i_otime_nsec = btrfs_stack_timespec_nsec(&inode_item->otime);
++	inode->i_ptime_sec = btrfs_stack_timespec_sec(&inode_item->ptime);
++	inode->i_ptime_nsec = btrfs_stack_timespec_nsec(&inode_item->ptime);
+ 
+ 	vfs_inode->i_generation = inode->generation;
+ 	if (S_ISDIR(vfs_inode->i_mode))
+--- /tmp/linux-6.19.11-ref/fs/btrfs/disk-io.c	2026-04-02 06:25:57.000000000 -0500
++++ /home/sean/ptime-build/linux/src/linux-6.19.11/fs/btrfs/disk-io.c	2026-04-05 00:58:03.777518258 -0500
+@@ -3011,6 +3011,11 @@
+ {
+ 	int ret;
+ 	const bool cache_opt = btrfs_test_opt(fs_info, SPACE_CACHE);
++
++	/* Clear PTIME compat_ro flag for local deployment.
++	 * This allows LTS/mainline kernels to boot normally.
++	 * Re-enable flag setting for upstream submission. */
++	btrfs_clear_fs_compat_ro(fs_info, PTIME);
+ 	bool rebuild_free_space_tree = false;
+ 
+ 	if (btrfs_test_opt(fs_info, CLEAR_CACHE) &&
+--- /tmp/linux-6.19.11-ref/fs/btrfs/fs.h	2026-04-02 06:25:57.000000000 -0500
++++ /home/sean/ptime-build/linux/src/linux-6.19.11/fs/btrfs/fs.h	2026-04-05 00:58:03.778038045 -0500
+@@ -284,7 +284,8 @@
+ 	(BTRFS_FEATURE_COMPAT_RO_FREE_SPACE_TREE |	\
+ 	 BTRFS_FEATURE_COMPAT_RO_FREE_SPACE_TREE_VALID | \
+ 	 BTRFS_FEATURE_COMPAT_RO_VERITY |		\
+-	 BTRFS_FEATURE_COMPAT_RO_BLOCK_GROUP_TREE)
++	 BTRFS_FEATURE_COMPAT_RO_BLOCK_GROUP_TREE | \
++	 BTRFS_FEATURE_COMPAT_RO_PTIME)
+ 
+ #define BTRFS_FEATURE_COMPAT_RO_SAFE_SET	0ULL
+ #define BTRFS_FEATURE_COMPAT_RO_SAFE_CLEAR	0ULL
+--- /tmp/linux-6.19.11-ref/fs/btrfs/inode.c	2026-04-02 06:25:57.000000000 -0500
++++ /home/sean/ptime-build/linux/src/linux-6.19.11/fs/btrfs/inode.c	2026-04-05 00:58:03.775044058 -0500
+@@ -4029,6 +4029,8 @@
+ 
+ 	inode->i_otime_sec = btrfs_timespec_sec(leaf, &inode_item->otime);
+ 	inode->i_otime_nsec = btrfs_timespec_nsec(leaf, &inode_item->otime);
++	inode->i_ptime_sec = btrfs_timespec_sec(leaf, &inode_item->ptime);
++	inode->i_ptime_nsec = btrfs_timespec_nsec(leaf, &inode_item->ptime);
+ 
+ 	inode_set_bytes(vfs_inode, btrfs_inode_nbytes(leaf, inode_item));
+ 	inode->generation = btrfs_inode_generation(leaf, inode_item);
+@@ -4220,6 +4222,8 @@
+ 
+ 	btrfs_set_timespec_sec(leaf, &item->otime, BTRFS_I(inode)->i_otime_sec);
+ 	btrfs_set_timespec_nsec(leaf, &item->otime, BTRFS_I(inode)->i_otime_nsec);
++	btrfs_set_timespec_sec(leaf, &item->ptime, BTRFS_I(inode)->i_ptime_sec);
++	btrfs_set_timespec_nsec(leaf, &item->ptime, BTRFS_I(inode)->i_ptime_nsec);
+ 
+ 	btrfs_set_inode_nbytes(leaf, item, inode_get_bytes(inode));
+ 	btrfs_set_inode_generation(leaf, item, BTRFS_I(inode)->generation);
+@@ -5424,7 +5428,15 @@
+ 	}
+ 
+ 	if (attr->ia_valid) {
+-		setattr_copy(idmap, inode, attr);
++		if (attr->ia_valid & ATTR_PTIME) {
++			BTRFS_I(inode)->i_ptime_sec = attr->ia_ptime.tv_sec;
++			BTRFS_I(inode)->i_ptime_nsec = attr->ia_ptime.tv_nsec;
++			/* COMPAT_RO_PTIME disabled for local deployment.
++			 * Re-enable for upstream submission to protect
++			 * against old kernels zeroing ptime on RW mount. */
++		}
++
++	setattr_copy(idmap, inode, attr);
+ 		inode_inc_iversion(inode);
+ 		ret = btrfs_dirty_inode(BTRFS_I(inode));
+ 
+@@ -8007,6 +8019,8 @@
+ 
+ 	ei->i_otime_sec = 0;
+ 	ei->i_otime_nsec = 0;
++	ei->i_ptime_sec = 0;
++	ei->i_ptime_nsec = 0;
+ 
+ 	inode = &ei->vfs_inode;
+ 	btrfs_extent_map_tree_init(&ei->extent_tree);
+@@ -8159,6 +8173,14 @@
+ 	u32 bi_ro_flags = BTRFS_I(inode)->ro_flags;
+ 
+ 	stat->result_mask |= STATX_BTIME;
++	if (request_mask & STATX_PTIME) {
++		if (BTRFS_I(inode)->i_ptime_sec ||
++		    BTRFS_I(inode)->i_ptime_nsec) {
++			stat->ptime.tv_sec = BTRFS_I(inode)->i_ptime_sec;
++			stat->ptime.tv_nsec = BTRFS_I(inode)->i_ptime_nsec;
++			stat->result_mask |= STATX_PTIME;
++		}
++	}
+ 	stat->btime.tv_sec = BTRFS_I(inode)->i_otime_sec;
+ 	stat->btime.tv_nsec = BTRFS_I(inode)->i_otime_nsec;
+ 	if (bi_flags & BTRFS_INODE_APPEND)
+@@ -8675,6 +8697,28 @@
+ 			btrfs_abort_transaction(trans, ret);
+ 			goto out_fail;
+ 		}
++		/*
++		 * ptime rename-over preservation: if a file with no ptime
++		 * is being renamed over a file that has ptime (the atomic
++		 * save pattern: write-to-temp + rename over original),
++		 * inherit the target's ptime so provenance survives.
++		 */
++		if (new_inode && S_ISREG(old_inode->i_mode) &&
++		    S_ISREG(new_inode->i_mode) && old_inode->i_nlink == 1 &&
++		    !(flags & (RENAME_EXCHANGE | RENAME_WHITEOUT))) {
++			struct btrfs_inode *old_bi = BTRFS_I(old_inode);
++			struct btrfs_inode *new_bi = BTRFS_I(new_inode);
++			if (!old_bi->i_ptime_sec && !old_bi->i_ptime_nsec &&
++			    (new_bi->i_ptime_sec || new_bi->i_ptime_nsec)) {
++				old_bi->i_ptime_sec = new_bi->i_ptime_sec;
++				old_bi->i_ptime_nsec = new_bi->i_ptime_nsec;
++			}
++		}
++		/* Note: if rename fails below, ptime mutation is harmless —
++		 * the source file keeps its previous ptime=0 semantics since
++		 * the rename didn't complete. The in-memory value will be
++		 * overwritten on next inode read from disk. */
++
+ 		ret = btrfs_update_inode(trans, BTRFS_I(old_inode));
+ 		if (unlikely(ret)) {
+ 			btrfs_abort_transaction(trans, ret);
+--- /tmp/linux-6.19.11-ref/fs/btrfs/tree-log.c	2026-04-02 06:25:57.000000000 -0500
++++ /home/sean/ptime-build/linux/src/linux-6.19.11/fs/btrfs/tree-log.c	2026-04-05 00:58:03.776673708 -0500
+@@ -4640,6 +4640,8 @@
+ 
+ 	btrfs_set_timespec_sec(leaf, &item->otime, BTRFS_I(inode)->i_otime_sec);
+ 	btrfs_set_timespec_nsec(leaf, &item->otime, BTRFS_I(inode)->i_otime_nsec);
++	btrfs_set_timespec_sec(leaf, &item->ptime, BTRFS_I(inode)->i_ptime_sec);
++	btrfs_set_timespec_nsec(leaf, &item->ptime, BTRFS_I(inode)->i_ptime_nsec);
+ 
+ 	/*
+ 	 * We do not need to set the nbytes field, in fact during a fast fsync
+--- /tmp/linux-6.19.11-ref/fs/ntfs3/file.c	2026-04-02 06:25:57.000000000 -0500
++++ /home/sean/ptime-build/linux/src/linux-6.19.11/fs/ntfs3/file.c	2026-04-05 00:58:03.779180409 -0500
+@@ -161,6 +161,13 @@
+ 
+ 	stat->result_mask |= STATX_BTIME;
+ 	stat->btime = ni->i_crtime;
++
++	/* Map NTFS creation time to ptime (provenance time) */
++	if (request_mask & STATX_PTIME) {
++		stat->ptime = ni->i_crtime;
++		stat->result_mask |= STATX_PTIME;
++	}
++
+ 	stat->blksize = ni->mi.sbi->cluster_size; /* 512, 1K, ..., 2M */
+ 
+ 	if (inode->i_flags & S_IMMUTABLE)
+@@ -857,6 +864,12 @@
+ 		i_size_write(inode, newsize);
+ 	}
+ 
++	/* Accept ptime and store as NTFS creation time */
++	if (ia_valid & ATTR_PTIME) {
++		ni->i_crtime = attr->ia_ptime;
++		ni->ni_flags |= NI_FLAG_UPDATE_PARENT;
++	}
++
+ 	setattr_copy(idmap, inode, attr);
+ 
+ 	if (mode != inode->i_mode) {
+--- /tmp/linux-6.19.11-ref/fs/ntfs3/frecord.c	2026-04-02 06:25:57.000000000 -0500
++++ /home/sean/ptime-build/linux/src/linux-6.19.11/fs/ntfs3/frecord.c	2026-04-05 00:58:03.779383222 -0500
+@@ -3197,6 +3197,14 @@
+ 			modified = true;
+ 		}
+ 
++		/* Write creation time (ptime maps to NTFS cr_time) */
++		ts = ni->i_crtime;
++		dup.cr_time = kernel2nt(&ts);
++		if (std->cr_time != dup.cr_time) {
++			std->cr_time = dup.cr_time;
++			modified = true;
++		}
++
+ 		dup.fa = ni->std_fa;
+ 		if (std->fa != dup.fa) {
+ 			std->fa = dup.fa;
+--- /tmp/linux-6.19.11-ref/fs/ntfs3/namei.c	2026-04-02 06:25:57.000000000 -0500
++++ /home/sean/ptime-build/linux/src/linux-6.19.11/fs/ntfs3/namei.c	2026-04-05 00:58:03.779683076 -0500
+@@ -292,6 +292,16 @@
+ 		return -EINVAL;
+ 	}
+ 
++	/* ptime rename-over: save target creation time before unlink */
++	struct timespec64 saved_crtime = {};
++	bool inherit_crtime = false;
++
++	if (new_inode && S_ISREG(inode->i_mode) &&
++	    S_ISREG(new_inode->i_mode) && inode->i_nlink == 1) {
++		saved_crtime = ntfs_i(new_inode)->i_crtime;
++		inherit_crtime = true;
++	}
++
+ 	if (new_inode) {
+ 		/* Target name exists. Unlink it. */
+ 		dget(new_dentry);
+@@ -330,6 +340,10 @@
+ 
+ 	err = ni_rename(dir_ni, new_dir_ni, ni, de, new_de);
+ 	if (!err) {
++		/* ptime rename-over: inherit target creation time */
++		if (inherit_crtime)
++			ni->i_crtime = saved_crtime;
++
+ 		simple_rename_timestamp(dir, dentry, new_dir, new_dentry);
+ 		mark_inode_dirty(inode);
+ 		mark_inode_dirty(dir);
+--- /tmp/linux-6.19.11-ref/fs/ext4/ext4.h	2026-04-02 06:25:57.000000000 -0500
++++ /home/sean/ptime-build/linux/src/linux-6.19.11/fs/ext4/ext4.h	2026-04-05 00:58:03.779852828 -0500
+@@ -860,6 +860,8 @@
+ 	__le32  i_crtime_extra; /* extra FileCreationtime (nsec << 2 | epoch) */
+ 	__le32  i_version_hi;	/* high 32 bits for 64-bit version */
+ 	__le32	i_projid;	/* Project ID */
++	__le32	i_ptime;		/* Provenance time */
++	__le32	i_ptime_extra;	/* extra Provenance time (nsec << 2 | epoch) */
+ };
+ 
+ #define EXT4_EPOCH_BITS 2
+@@ -1136,6 +1138,7 @@
+ 	 * struct timespec64 i_{a,c,m}time in the generic inode.
+ 	 */
+ 	struct timespec64 i_crtime;
++	struct timespec64 i_ptime;
+ 
+ 	/* mballoc */
+ 	atomic_t i_prealloc_active;
+--- /tmp/linux-6.19.11-ref/fs/ext4/inode.c	2026-04-02 06:25:57.000000000 -0500
++++ /home/sean/ptime-build/linux/src/linux-6.19.11/fs/ext4/inode.c	2026-04-05 00:58:03.780550916 -0500
+@@ -4753,6 +4753,7 @@
+ 	EXT4_INODE_SET_MTIME(inode, raw_inode);
+ 	EXT4_INODE_SET_ATIME(inode, raw_inode);
+ 	EXT4_EINODE_SET_XTIME(i_crtime, ei, raw_inode);
++	EXT4_EINODE_SET_XTIME(i_ptime, ei, raw_inode);
+ 
+ 	raw_inode->i_dtime = cpu_to_le32(ei->i_dtime);
+ 	raw_inode->i_flags = cpu_to_le32(ei->i_flags & 0xFFFFFFFF);
+@@ -5409,6 +5410,7 @@
+ 	EXT4_INODE_GET_ATIME(inode, raw_inode);
+ 	EXT4_INODE_GET_MTIME(inode, raw_inode);
+ 	EXT4_EINODE_GET_XTIME(i_crtime, ei, raw_inode);
++	EXT4_EINODE_GET_XTIME(i_ptime, ei, raw_inode);
+ 
+ 	if (likely(!test_opt2(inode->i_sb, HURD_COMPAT))) {
+ 		u64 ivers = le32_to_cpu(raw_inode->i_disk_version);
+@@ -6061,6 +6063,9 @@
+ 	if (!error) {
+ 		if (inc_ivers)
+ 			inode_inc_iversion(inode);
++		if (attr->ia_valid & ATTR_PTIME)
++			EXT4_I(inode)->i_ptime = attr->ia_ptime;
++
+ 		setattr_copy(idmap, inode, attr);
+ 		mark_inode_dirty(inode);
+ 	}
+@@ -6114,6 +6119,15 @@
+ 		stat->btime.tv_nsec = ei->i_crtime.tv_nsec;
+ 	}
+ 
++	/* Report ptime from dedicated field, not crtime */
++	if ((request_mask & STATX_PTIME) &&
++	    EXT4_FITS_IN_INODE(raw_inode, ei, i_ptime) &&
++	    (ei->i_ptime.tv_sec || ei->i_ptime.tv_nsec)) {
++		stat->result_mask |= STATX_PTIME;
++		stat->ptime.tv_sec = ei->i_ptime.tv_sec;
++		stat->ptime.tv_nsec = ei->i_ptime.tv_nsec;
++	}
++
+ 	/*
+ 	 * Return the DIO alignment restrictions if requested.  We only return
+ 	 * this information when requested, since on encrypted files it might
+--- /tmp/linux-6.19.11-ref/fs/ext4/namei.c	2026-04-02 06:25:57.000000000 -0500
++++ /home/sean/ptime-build/linux/src/linux-6.19.11/fs/ext4/namei.c	2026-04-05 00:58:03.781292436 -0500
+@@ -3942,6 +3942,19 @@
+ 	 * rename.
+ 	 */
+ 	inode_set_ctime_current(old.inode);
++
++	/* ptime rename-over: preserve ptime across atomic saves */
++	if (new.inode && S_ISREG(old.inode->i_mode) &&
++	    S_ISREG(new.inode->i_mode) && old.inode->i_nlink == 1 &&
++	    !(flags & RENAME_WHITEOUT)) {
++		struct ext4_inode_info *old_ei = EXT4_I(old.inode);
++		struct ext4_inode_info *new_ei = EXT4_I(new.inode);
++
++		if (!old_ei->i_ptime.tv_sec && !old_ei->i_ptime.tv_nsec &&
++		    (new_ei->i_ptime.tv_sec || new_ei->i_ptime.tv_nsec))
++			old_ei->i_ptime = new_ei->i_ptime;
++	}
++
+ 	retval = ext4_mark_inode_dirty(handle, old.inode);
+ 	if (unlikely(retval))
+ 		goto end_rename;
+--- /tmp/linux-6.19.11-ref/fs/fat/file.c	2026-04-02 06:25:57.000000000 -0500
++++ /home/sean/ptime-build/linux/src/linux-6.19.11/fs/fat/file.c	2026-04-05 00:58:03.781767272 -0500
+@@ -413,6 +413,10 @@
+ 		stat->result_mask |= STATX_BTIME;
+ 		stat->btime = MSDOS_I(inode)->i_crtime;
+ 	}
++	if (sbi->options.isvfat && (request_mask & STATX_PTIME)) {
++		stat->result_mask |= STATX_PTIME;
++		stat->ptime = MSDOS_I(inode)->i_crtime;
++	}
+ 
+ 	return 0;
+ }
+@@ -564,6 +568,8 @@
+ 		fat_truncate_time(inode, &attr->ia_mtime, S_MTIME);
+ 	attr->ia_valid &= ~(ATTR_ATIME|ATTR_CTIME|ATTR_MTIME);
+ 
++	if (attr->ia_valid & ATTR_PTIME)
++		MSDOS_I(inode)->i_crtime = attr->ia_ptime;
+ 	setattr_copy(idmap, inode, attr);
+ 	mark_inode_dirty(inode);
+ out:
+--- /tmp/linux-6.19.11-ref/fs/fat/namei_vfat.c	2026-04-02 06:25:57.000000000 -0500
++++ /home/sean/ptime-build/linux/src/linux-6.19.11/fs/fat/namei_vfat.c	2026-04-05 00:58:03.781890513 -0500
+@@ -975,8 +975,24 @@
+ 	}
+ 	inode_inc_iversion(new_dir);
+ 
+-	fat_detach(old_inode);
+-	fat_attach(old_inode, new_i_pos);
++	/* ptime rename-over: save target creation time */
++	{
++		struct timespec64 saved_crtime = {};
++		bool inherit_crtime = false;
++
++		if (new_inode && S_ISREG(old_inode->i_mode) &&
++		    S_ISREG(new_inode->i_mode) && old_inode->i_nlink == 1) {
++			saved_crtime = MSDOS_I(new_inode)->i_crtime;
++			inherit_crtime = true;
++		}
++
++		fat_detach(old_inode);
++		fat_attach(old_inode, new_i_pos);
++
++		if (inherit_crtime)
++			MSDOS_I(old_inode)->i_crtime = saved_crtime;
++	}
++
+ 	err = vfat_sync_ipos(new_dir, old_inode);
+ 	if (err)
+ 		goto error_inode;
+--- /tmp/linux-6.19.11-ref/fs/exfat/file.c	2026-04-02 06:25:57.000000000 -0500
++++ /home/sean/ptime-build/linux/src/linux-6.19.11/fs/exfat/file.c	2026-04-05 00:58:03.782040475 -0500
+@@ -277,6 +277,11 @@
+ 	stat->result_mask |= STATX_BTIME;
+ 	stat->btime.tv_sec = ei->i_crtime.tv_sec;
+ 	stat->btime.tv_nsec = ei->i_crtime.tv_nsec;
++	if (request_mask & STATX_PTIME) {
++		stat->result_mask |= STATX_PTIME;
++		stat->ptime.tv_sec = ei->i_crtime.tv_sec;
++		stat->ptime.tv_nsec = ei->i_crtime.tv_nsec;
++	}
+ 	stat->blksize = EXFAT_SB(inode->i_sb)->cluster_size;
+ 	return 0;
+ }
+@@ -337,6 +342,10 @@
+ 	if (attr->ia_valid & ATTR_SIZE)
+ 		inode_set_mtime_to_ts(inode, inode_set_ctime_current(inode));
+ 
++	if (attr->ia_valid & ATTR_PTIME) {
++		struct exfat_inode_info *exi = EXFAT_I(inode);
++		exi->i_crtime = attr->ia_ptime;
++	}
+ 	setattr_copy(idmap, inode, attr);
+ 	exfat_truncate_inode_atime(inode);
+ 
+--- /tmp/linux-6.19.11-ref/fs/exfat/namei.c	2026-04-02 06:25:57.000000000 -0500
++++ /home/sean/ptime-build/linux/src/linux-6.19.11/fs/exfat/namei.c	2026-04-05 00:58:03.782166507 -0500
+@@ -1262,9 +1262,24 @@
+ 	old_inode = old_dentry->d_inode;
+ 	new_inode = new_dentry->d_inode;
+ 
+-	err = __exfat_rename(old_dir, EXFAT_I(old_inode), new_dir, new_dentry);
+-	if (err)
+-		goto unlock;
++	/* ptime rename-over: save target creation time */
++	{
++		struct timespec64 saved_crtime = {};
++		bool inherit_crtime = false;
++
++		if (new_inode && S_ISREG(old_inode->i_mode) &&
++		    S_ISREG(new_inode->i_mode) && old_inode->i_nlink == 1) {
++			saved_crtime = EXFAT_I(new_inode)->i_crtime;
++			inherit_crtime = true;
++		}
++
++		err = __exfat_rename(old_dir, EXFAT_I(old_inode), new_dir, new_dentry);
++		if (err)
++			goto unlock;
++
++		if (inherit_crtime)
++			EXFAT_I(old_inode)->i_crtime = saved_crtime;
++	}
+ 
+ 	inode_inc_iversion(new_dir);
+ 	simple_rename_timestamp(old_dir, old_dentry, new_dir, new_dentry);
