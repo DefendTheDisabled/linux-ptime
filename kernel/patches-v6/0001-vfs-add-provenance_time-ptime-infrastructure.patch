@@ -1,0 +1,250 @@
+From 448894d1fcdc8eacdc57623658ba0e2116663701 Mon Sep 17 00:00:00 2001
+From: Sean Smith <DefendTheDisabled@gmail.com>
+Date: Tue, 7 Apr 2026 16:46:40 -0500
+Subject: [PATCH 1/6] vfs: add provenance_time (ptime) infrastructure
+
+Add ptime (provenance time) as a new settable inode timestamp.
+
+VFS changes:
+- ATTR_PTIME/ATTR_PTIME_SET bits (19/20) in struct iattr
+- ia_ptime field in struct iattr
+- ptime field in struct kstat
+- STATX_PTIME (0x00040000) and stx_ptime at offset 0xC0 in struct statx
+- struct file_attr extended with VER1 ptime fields (fa_ptime_sec,
+  fa_ptime_nsec, fa_ptime_pad) for file_setattr syscall (469)
+- struct file_kattr extended with ptime_valid + struct timespec64 ptime
+- file_setattr dual-dispatch: ptime via notify_change (iattr/setattr),
+  xflags via vfs_fileattr_set
+- Validation: fa_ptime_nsec < NSEC_PER_SEC, fa_ptime_pad must be zero
+- setattr_prepare: ATTR_PTIME_SET requires inode_owner_or_capable
+- notify_change: ptime truncation and set-to-now logic
+
+Signed-off-by: Sean Smith <DefendTheDisabled@gmail.com>
+---
+ fs/attr.c                 |  6 +++-
+ fs/file_attr.c            | 60 ++++++++++++++++++++++++++++++++++++---
+ fs/stat.c                 |  2 ++
+ include/linux/fileattr.h  |  5 ++++
+ include/linux/fs.h        |  3 ++
+ include/linux/stat.h      |  1 +
+ include/uapi/linux/fs.h   |  7 ++++-
+ include/uapi/linux/stat.h |  4 ++-
+ 8 files changed, 81 insertions(+), 7 deletions(-)
+
+diff --git a/fs/attr.c b/fs/attr.c
+index b9ec6b47b..7fa9c01d1 100644
+--- a/fs/attr.c
++++ b/fs/attr.c
+@@ -206,7 +206,7 @@ int setattr_prepare(struct mnt_idmap *idmap, struct dentry *dentry,
+ 	}
+ 
+ 	/* Check for setting the inode time. */
+-	if (ia_valid & (ATTR_MTIME_SET | ATTR_ATIME_SET | ATTR_TIMES_SET)) {
++	if (ia_valid & (ATTR_MTIME_SET | ATTR_ATIME_SET | ATTR_PTIME_SET | ATTR_TIMES_SET)) {
+ 		if (!inode_owner_or_capable(idmap, inode))
+ 			return -EPERM;
+ 	}
+@@ -466,6 +466,10 @@ int notify_change(struct mnt_idmap *idmap, struct dentry *dentry,
+ 		attr->ia_mtime = timestamp_truncate(attr->ia_mtime, inode);
+ 	else
+ 		attr->ia_mtime = now;
++	if (ia_valid & ATTR_PTIME_SET)
++		attr->ia_ptime = timestamp_truncate(attr->ia_ptime, inode);
++	else if (ia_valid & ATTR_PTIME)
++		attr->ia_ptime = now;
+ 
+ 	if (ia_valid & ATTR_KILL_PRIV) {
+ 		error = security_inode_need_killpriv(dentry);
+diff --git a/fs/file_attr.c b/fs/file_attr.c
+index 4889cf59b..443ddad66 100644
+--- a/fs/file_attr.c
++++ b/fs/file_attr.c
+@@ -148,6 +148,10 @@ static int file_attr_to_fileattr(const struct file_attr *fattr,
+ 	fa->fsx_projid = fattr->fa_projid;
+ 	fa->fsx_cowextsize = fattr->fa_cowextsize;
+ 
++	/* Always copy ptime fields; caller sets ptime_valid based on usize */
++	fa->ptime.tv_sec = fattr->fa_ptime_sec;
++	fa->ptime.tv_nsec = fattr->fa_ptime_nsec;
++
+ 	return 0;
+ }
+ 
+@@ -481,10 +485,58 @@ SYSCALL_DEFINE5(file_setattr, int, dfd, const char __user *, filename,
+ 
+ 	error = mnt_want_write(filepath.mnt);
+ 	if (!error) {
+-		error = vfs_fileattr_set(mnt_idmap(filepath.mnt),
+-					 filepath.dentry, &fa);
+-		if (error == -ENOIOCTLCMD || error == -ENOTTY)
+-			error = -EOPNOTSUPP;
++		/* ptime fields present only if userspace struct is VER1+ */
++		if (usize >= FILE_ATTR_SIZE_VER1) {
++			if (fattr.fa_ptime_pad != 0) {
++				error = -EINVAL;
++				goto drop_write;
++			}
++			if (fattr.fa_ptime_nsec >= 1000000000U) {
++				error = -EINVAL;
++				goto drop_write;
++			}
++			fa.ptime_valid = true;
++		}
++
++		/* Handle ptime via notify_change (iattr/setattr path).
++		 * Lock/unlock inode separately from vfs_fileattr_set below;
++		 * sequential acquisition, never nested — no deadlock risk.
++		 * ptime and xflags are orthogonal; brief TOCTOU gap between
++		 * the two operations is acceptable (same as chmod+chown). */
++		if (fa.ptime_valid) {
++			struct iattr attr = {};
++			struct inode *inode = d_inode(filepath.dentry);
++
++			attr.ia_valid = ATTR_PTIME | ATTR_PTIME_SET;
++			attr.ia_ptime = fa.ptime;
++			inode_lock(inode);
++			error = notify_change(mnt_idmap(filepath.mnt),
++					      filepath.dentry, &attr, NULL);
++			inode_unlock(inode);
++			if (error)
++				goto drop_write;
++		}
++
++		/* Handle file attrs (xflags, extsize, projid, cowextsize).
++		 * Clear ptime from file_kattr — already handled via
++		 * notify_change above; .fileattr_set must not process it. */
++		{
++			bool had_ptime = fa.ptime_valid;
++			fa.ptime_valid = false;
++			fa.ptime = (struct timespec64){};
++
++			if (fattr.fa_xflags || fattr.fa_extsize ||
++			    fattr.fa_projid || fattr.fa_cowextsize) {
++				error = vfs_fileattr_set(mnt_idmap(filepath.mnt),
++							 filepath.dentry, &fa);
++				if (error == -ENOIOCTLCMD || error == -ENOTTY)
++					error = -EOPNOTSUPP;
++			} else if (!had_ptime) {
++				/* No ptime and no file attrs -- nothing to set */
++				error = -EINVAL;
++			}
++		}
++drop_write:
+ 		mnt_drop_write(filepath.mnt);
+ 	}
+ 
+diff --git a/fs/stat.c b/fs/stat.c
+index 6c79661e1..9284bb753 100644
+--- a/fs/stat.c
++++ b/fs/stat.c
+@@ -728,6 +728,8 @@ cp_statx(const struct kstat *stat, struct statx __user *buffer)
+ 	tmp.stx_atime.tv_nsec = stat->atime.tv_nsec;
+ 	tmp.stx_btime.tv_sec = stat->btime.tv_sec;
+ 	tmp.stx_btime.tv_nsec = stat->btime.tv_nsec;
++	tmp.stx_ptime.tv_sec = stat->ptime.tv_sec;
++	tmp.stx_ptime.tv_nsec = stat->ptime.tv_nsec;
+ 	tmp.stx_ctime.tv_sec = stat->ctime.tv_sec;
+ 	tmp.stx_ctime.tv_nsec = stat->ctime.tv_nsec;
+ 	tmp.stx_mtime.tv_sec = stat->mtime.tv_sec;
+diff --git a/include/linux/fileattr.h b/include/linux/fileattr.h
+index f89dcfad3..7db01e604 100644
+--- a/include/linux/fileattr.h
++++ b/include/linux/fileattr.h
+@@ -3,6 +3,8 @@
+ #ifndef _LINUX_FILEATTR_H
+ #define _LINUX_FILEATTR_H
+ 
++#include <linux/time64.h>
++
+ /* Flags shared betwen flags/xflags */
+ #define FS_COMMON_FL \
+ 	(FS_SYNC_FL | FS_IMMUTABLE_FL | FS_APPEND_FL | \
+@@ -51,6 +53,9 @@ struct file_kattr {
+ 	/* selectors: */
+ 	bool	flags_valid:1;
+ 	bool	fsx_valid:1;
++	bool	ptime_valid:1;
++	/* provenance time */
++	struct timespec64 ptime;
+ };
+ 
+ int copy_fsxattr_to_user(const struct file_kattr *fa, struct fsxattr __user *ufa);
+diff --git a/include/linux/fs.h b/include/linux/fs.h
+index a01621fa6..e01f9a2a1 100644
+--- a/include/linux/fs.h
++++ b/include/linux/fs.h
+@@ -239,6 +239,8 @@ typedef int (dio_iodone_t)(struct kiocb *iocb, loff_t offset,
+ #define ATTR_TIMES_SET	(1 << 16)
+ #define ATTR_TOUCH	(1 << 17)
+ #define ATTR_DELEG	(1 << 18) /* Delegated attrs. Don't break write delegations */
++#define ATTR_PTIME	(1 << 19) /* Set provenance time */
++#define ATTR_PTIME_SET	(1 << 20) /* Set provenance time to specific value */
+ 
+ /*
+  * Whiteout is represented by a char device.  The following constants define the
+@@ -283,6 +285,7 @@ struct iattr {
+ 	struct timespec64 ia_atime;
+ 	struct timespec64 ia_mtime;
+ 	struct timespec64 ia_ctime;
++	struct timespec64 ia_ptime;
+ 
+ 	/*
+ 	 * Not an attribute, but an auxiliary info for filesystems wanting to
+diff --git a/include/linux/stat.h b/include/linux/stat.h
+index e3d00e7bb..52272000c 100644
+--- a/include/linux/stat.h
++++ b/include/linux/stat.h
+@@ -48,6 +48,7 @@ struct kstat {
+ 	struct timespec64 mtime;
+ 	struct timespec64 ctime;
+ 	struct timespec64 btime;			/* File creation time */
++	struct timespec64 ptime;			/* Provenance time */
+ 	u64		blocks;
+ 	u64		mnt_id;
+ 	u64		change_cookie;
+diff --git a/include/uapi/linux/fs.h b/include/uapi/linux/fs.h
+index 66ca526cf..d6d9cd542 100644
+--- a/include/uapi/linux/fs.h
++++ b/include/uapi/linux/fs.h
+@@ -229,10 +229,15 @@ struct file_attr {
+ 	__u32 fa_nextents;	/* nextents field value (get)   */
+ 	__u32 fa_projid;	/* project identifier (get/set) */
+ 	__u32 fa_cowextsize;	/* CoW extsize field value (get/set) */
++	/* ptime (provenance time) extension — VER1 */
++	__s64 fa_ptime_sec;	/* provenance time: seconds since epoch */
++	__u32 fa_ptime_nsec;	/* provenance time: nanoseconds */
++	__u32 fa_ptime_pad;	/* alignment padding */
+ };
+ 
+ #define FILE_ATTR_SIZE_VER0 24
+-#define FILE_ATTR_SIZE_LATEST FILE_ATTR_SIZE_VER0
++#define FILE_ATTR_SIZE_VER1 (FILE_ATTR_SIZE_VER0 + 16)
++#define FILE_ATTR_SIZE_LATEST FILE_ATTR_SIZE_VER1
+ 
+ /*
+  * Flags for the fsx_xflags field
+diff --git a/include/uapi/linux/stat.h b/include/uapi/linux/stat.h
+index 1686861aa..0c8db3715 100644
+--- a/include/uapi/linux/stat.h
++++ b/include/uapi/linux/stat.h
+@@ -187,7 +187,8 @@ struct statx {
+ 	__u32	__spare2[1];
+ 
+ 	/* 0xc0 */
+-	__u64	__spare3[8];	/* Spare space for future expansion */
++	struct statx_timestamp	stx_ptime;	/* File provenance time */
++	__u64	__spare3[6];		/* Spare space for future expansion */
+ 
+ 	/* 0x100 */
+ };
+@@ -219,6 +220,7 @@ struct statx {
+ #define STATX_SUBVOL		0x00008000U	/* Want/got stx_subvol */
+ #define STATX_WRITE_ATOMIC	0x00010000U	/* Want/got atomic_write_* fields */
+ #define STATX_DIO_READ_ALIGN	0x00020000U	/* Want/got dio read alignment info */
++#define STATX_PTIME		0x00040000U	/* Want/got stx_ptime */
+ 
+ #define STATX__RESERVED		0x80000000U	/* Reserved for future struct statx expansion */
+ 
+-- 
+2.53.0
+

@@ -1,0 +1,224 @@
+From 653a576d65f890891317ea803532eca5cbf66f59 Mon Sep 17 00:00:00 2001
+From: Sean Smith <DefendTheDisabled@gmail.com>
+Date: Tue, 7 Apr 2026 16:46:50 -0500
+Subject: [PATCH 2/6] btrfs: add provenance time (ptime) support
+
+Native ptime field in btrfs_inode_item reserved space. Delayed-inode
+read/write persistence. Tree-log preservation. Rename-over with
+zero-sentinel logic. COMPAT_RO_PTIME feature flag (cleared locally
+for three-kernel boot safety). New inode initialization.
+
+Signed-off-by: Sean Smith <DefendTheDisabled@gmail.com>
+---
+ fs/btrfs/btrfs_inode.h          |  4 +++
+ fs/btrfs/delayed-inode.c        |  4 +++
+ fs/btrfs/disk-io.c              |  5 ++++
+ fs/btrfs/fs.h                   |  3 ++-
+ fs/btrfs/inode.c                | 46 ++++++++++++++++++++++++++++++++-
+ fs/btrfs/tree-log.c             |  2 ++
+ include/uapi/linux/btrfs.h      |  1 +
+ include/uapi/linux/btrfs_tree.h |  4 ++-
+ 8 files changed, 66 insertions(+), 3 deletions(-)
+
+diff --git a/fs/btrfs/btrfs_inode.h b/fs/btrfs/btrfs_inode.h
+index 73602ee8d..bac92f766 100644
+--- a/fs/btrfs/btrfs_inode.h
++++ b/fs/btrfs/btrfs_inode.h
+@@ -334,6 +334,10 @@ struct btrfs_inode {
+ 	u64 i_otime_sec;
+ 	u32 i_otime_nsec;
+ 
++	/* Provenance time - original creation date of file content. */
++	u64 i_ptime_sec;
++	u32 i_ptime_nsec;
++
+ 	/* Hook into fs_info->delayed_iputs */
+ 	struct list_head delayed_iput;
+ 
+diff --git a/fs/btrfs/delayed-inode.c b/fs/btrfs/delayed-inode.c
+index 7e3d294a6..649de7c29 100644
+--- a/fs/btrfs/delayed-inode.c
++++ b/fs/btrfs/delayed-inode.c
+@@ -1887,6 +1887,8 @@ static void fill_stack_inode_item(struct btrfs_trans_handle *trans,
+ 
+ 	btrfs_set_stack_timespec_sec(&inode_item->otime, inode->i_otime_sec);
+ 	btrfs_set_stack_timespec_nsec(&inode_item->otime, inode->i_otime_nsec);
++	btrfs_set_stack_timespec_sec(&inode_item->ptime, inode->i_ptime_sec);
++	btrfs_set_stack_timespec_nsec(&inode_item->ptime, inode->i_ptime_nsec);
+ }
+ 
+ int btrfs_fill_inode(struct btrfs_inode *inode, u32 *rdev)
+@@ -1935,6 +1937,8 @@ int btrfs_fill_inode(struct btrfs_inode *inode, u32 *rdev)
+ 
+ 	inode->i_otime_sec = btrfs_stack_timespec_sec(&inode_item->otime);
+ 	inode->i_otime_nsec = btrfs_stack_timespec_nsec(&inode_item->otime);
++	inode->i_ptime_sec = btrfs_stack_timespec_sec(&inode_item->ptime);
++	inode->i_ptime_nsec = btrfs_stack_timespec_nsec(&inode_item->ptime);
+ 
+ 	vfs_inode->i_generation = inode->generation;
+ 	if (S_ISDIR(vfs_inode->i_mode))
+diff --git a/fs/btrfs/disk-io.c b/fs/btrfs/disk-io.c
+index 8df7eb7f0..ba5057c90 100644
+--- a/fs/btrfs/disk-io.c
++++ b/fs/btrfs/disk-io.c
+@@ -3011,6 +3011,11 @@ int btrfs_start_pre_rw_mount(struct btrfs_fs_info *fs_info)
+ {
+ 	int ret;
+ 	const bool cache_opt = btrfs_test_opt(fs_info, SPACE_CACHE);
++
++	/* Clear PTIME compat_ro flag for local deployment.
++	 * This allows LTS/mainline kernels to boot normally.
++	 * Re-enable flag setting for upstream submission. */
++	btrfs_clear_fs_compat_ro(fs_info, PTIME);
+ 	bool rebuild_free_space_tree = false;
+ 
+ 	if (btrfs_test_opt(fs_info, CLEAR_CACHE) &&
+diff --git a/fs/btrfs/fs.h b/fs/btrfs/fs.h
+index 8ffbc40eb..7c8105ecf 100644
+--- a/fs/btrfs/fs.h
++++ b/fs/btrfs/fs.h
+@@ -284,7 +284,8 @@ enum {
+ 	(BTRFS_FEATURE_COMPAT_RO_FREE_SPACE_TREE |	\
+ 	 BTRFS_FEATURE_COMPAT_RO_FREE_SPACE_TREE_VALID | \
+ 	 BTRFS_FEATURE_COMPAT_RO_VERITY |		\
+-	 BTRFS_FEATURE_COMPAT_RO_BLOCK_GROUP_TREE)
++	 BTRFS_FEATURE_COMPAT_RO_BLOCK_GROUP_TREE | \
++	 BTRFS_FEATURE_COMPAT_RO_PTIME)
+ 
+ #define BTRFS_FEATURE_COMPAT_RO_SAFE_SET	0ULL
+ #define BTRFS_FEATURE_COMPAT_RO_SAFE_CLEAR	0ULL
+diff --git a/fs/btrfs/inode.c b/fs/btrfs/inode.c
+index 13f1f3b52..a111f4896 100644
+--- a/fs/btrfs/inode.c
++++ b/fs/btrfs/inode.c
+@@ -4029,6 +4029,8 @@ static int btrfs_read_locked_inode(struct btrfs_inode *inode, struct btrfs_path
+ 
+ 	inode->i_otime_sec = btrfs_timespec_sec(leaf, &inode_item->otime);
+ 	inode->i_otime_nsec = btrfs_timespec_nsec(leaf, &inode_item->otime);
++	inode->i_ptime_sec = btrfs_timespec_sec(leaf, &inode_item->ptime);
++	inode->i_ptime_nsec = btrfs_timespec_nsec(leaf, &inode_item->ptime);
+ 
+ 	inode_set_bytes(vfs_inode, btrfs_inode_nbytes(leaf, inode_item));
+ 	inode->generation = btrfs_inode_generation(leaf, inode_item);
+@@ -4220,6 +4222,8 @@ static void fill_inode_item(struct btrfs_trans_handle *trans,
+ 
+ 	btrfs_set_timespec_sec(leaf, &item->otime, BTRFS_I(inode)->i_otime_sec);
+ 	btrfs_set_timespec_nsec(leaf, &item->otime, BTRFS_I(inode)->i_otime_nsec);
++	btrfs_set_timespec_sec(leaf, &item->ptime, BTRFS_I(inode)->i_ptime_sec);
++	btrfs_set_timespec_nsec(leaf, &item->ptime, BTRFS_I(inode)->i_ptime_nsec);
+ 
+ 	btrfs_set_inode_nbytes(leaf, item, inode_get_bytes(inode));
+ 	btrfs_set_inode_generation(leaf, item, BTRFS_I(inode)->generation);
+@@ -5424,7 +5428,15 @@ static int btrfs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
+ 	}
+ 
+ 	if (attr->ia_valid) {
+-		setattr_copy(idmap, inode, attr);
++		if (attr->ia_valid & ATTR_PTIME) {
++			BTRFS_I(inode)->i_ptime_sec = attr->ia_ptime.tv_sec;
++			BTRFS_I(inode)->i_ptime_nsec = attr->ia_ptime.tv_nsec;
++			/* COMPAT_RO_PTIME disabled for local deployment.
++			 * Re-enable for upstream submission to protect
++			 * against old kernels zeroing ptime on RW mount. */
++		}
++
++	setattr_copy(idmap, inode, attr);
+ 		inode_inc_iversion(inode);
+ 		ret = btrfs_dirty_inode(BTRFS_I(inode));
+ 
+@@ -8007,6 +8019,8 @@ struct inode *btrfs_alloc_inode(struct super_block *sb)
+ 
+ 	ei->i_otime_sec = 0;
+ 	ei->i_otime_nsec = 0;
++	ei->i_ptime_sec = 0;
++	ei->i_ptime_nsec = 0;
+ 
+ 	inode = &ei->vfs_inode;
+ 	btrfs_extent_map_tree_init(&ei->extent_tree);
+@@ -8159,6 +8173,14 @@ static int btrfs_getattr(struct mnt_idmap *idmap,
+ 	u32 bi_ro_flags = BTRFS_I(inode)->ro_flags;
+ 
+ 	stat->result_mask |= STATX_BTIME;
++	if (request_mask & STATX_PTIME) {
++		if (BTRFS_I(inode)->i_ptime_sec ||
++		    BTRFS_I(inode)->i_ptime_nsec) {
++			stat->ptime.tv_sec = BTRFS_I(inode)->i_ptime_sec;
++			stat->ptime.tv_nsec = BTRFS_I(inode)->i_ptime_nsec;
++			stat->result_mask |= STATX_PTIME;
++		}
++	}
+ 	stat->btime.tv_sec = BTRFS_I(inode)->i_otime_sec;
+ 	stat->btime.tv_nsec = BTRFS_I(inode)->i_otime_nsec;
+ 	if (bi_flags & BTRFS_INODE_APPEND)
+@@ -8675,6 +8697,28 @@ static int btrfs_rename(struct mnt_idmap *idmap,
+ 			btrfs_abort_transaction(trans, ret);
+ 			goto out_fail;
+ 		}
++		/*
++		 * ptime rename-over preservation: if a file with no ptime
++		 * is being renamed over a file that has ptime (the atomic
++		 * save pattern: write-to-temp + rename over original),
++		 * inherit the target's ptime so provenance survives.
++		 */
++		if (new_inode && S_ISREG(old_inode->i_mode) &&
++		    S_ISREG(new_inode->i_mode) && old_inode->i_nlink == 1 &&
++		    !(flags & (RENAME_EXCHANGE | RENAME_WHITEOUT))) {
++			struct btrfs_inode *old_bi = BTRFS_I(old_inode);
++			struct btrfs_inode *new_bi = BTRFS_I(new_inode);
++			if (!old_bi->i_ptime_sec && !old_bi->i_ptime_nsec &&
++			    (new_bi->i_ptime_sec || new_bi->i_ptime_nsec)) {
++				old_bi->i_ptime_sec = new_bi->i_ptime_sec;
++				old_bi->i_ptime_nsec = new_bi->i_ptime_nsec;
++			}
++		}
++		/* Note: if rename fails below, ptime mutation is harmless —
++		 * the source file keeps its previous ptime=0 semantics since
++		 * the rename didn't complete. The in-memory value will be
++		 * overwritten on next inode read from disk. */
++
+ 		ret = btrfs_update_inode(trans, BTRFS_I(old_inode));
+ 		if (unlikely(ret)) {
+ 			btrfs_abort_transaction(trans, ret);
+diff --git a/fs/btrfs/tree-log.c b/fs/btrfs/tree-log.c
+index 6c40f48cc..7ed09af22 100644
+--- a/fs/btrfs/tree-log.c
++++ b/fs/btrfs/tree-log.c
+@@ -4640,6 +4640,8 @@ static void fill_inode_item(struct btrfs_trans_handle *trans,
+ 
+ 	btrfs_set_timespec_sec(leaf, &item->otime, BTRFS_I(inode)->i_otime_sec);
+ 	btrfs_set_timespec_nsec(leaf, &item->otime, BTRFS_I(inode)->i_otime_nsec);
++	btrfs_set_timespec_sec(leaf, &item->ptime, BTRFS_I(inode)->i_ptime_sec);
++	btrfs_set_timespec_nsec(leaf, &item->ptime, BTRFS_I(inode)->i_ptime_nsec);
+ 
+ 	/*
+ 	 * We do not need to set the nbytes field, in fact during a fast fsync
+diff --git a/include/uapi/linux/btrfs.h b/include/uapi/linux/btrfs.h
+index e8fd92789..d2c542425 100644
+--- a/include/uapi/linux/btrfs.h
++++ b/include/uapi/linux/btrfs.h
+@@ -313,6 +313,7 @@ struct btrfs_ioctl_fs_info_args {
+  * reducing mount time for large filesystem due to better locality.
+  */
+ #define BTRFS_FEATURE_COMPAT_RO_BLOCK_GROUP_TREE	(1ULL << 3)
++#define BTRFS_FEATURE_COMPAT_RO_PTIME			(1ULL << 4)
+ 
+ #define BTRFS_FEATURE_INCOMPAT_MIXED_BACKREF	(1ULL << 0)
+ #define BTRFS_FEATURE_INCOMPAT_DEFAULT_SUBVOL	(1ULL << 1)
+diff --git a/include/uapi/linux/btrfs_tree.h b/include/uapi/linux/btrfs_tree.h
+index fc29d2738..719c00363 100644
+--- a/include/uapi/linux/btrfs_tree.h
++++ b/include/uapi/linux/btrfs_tree.h
+@@ -890,7 +890,9 @@ struct btrfs_inode_item {
+ 	 * a little future expansion, for more than this we can
+ 	 * just grow the inode item and version it
+ 	 */
+-	__le64 reserved[4];
++	struct btrfs_timespec ptime;
++	__le32 __reserved_pad;
++	__le64 reserved[2];
+ 	struct btrfs_timespec atime;
+ 	struct btrfs_timespec ctime;
+ 	struct btrfs_timespec mtime;
+-- 
+2.53.0
+
