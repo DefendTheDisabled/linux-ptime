@@ -1,0 +1,49 @@
+From 2f5d4a2d9c47ca2f75ac9e43e1e26513b4fe2b75 Mon Sep 17 00:00:00 2001
+From: Sean Smith <DefendTheDisabled@gmail.com>
+Date: Thu, 9 Apr 2026 16:01:00 -0500
+Subject: [PATCH 12/16] ext4: preserve ptime across rename-over
+
+Implements rename-over preservation for ext4, mirroring the
+Btrfs approach. When the atomic save pattern renames a temp
+file over an existing file, inherit the existing file's ptime
+onto the new inode before completing the rename.
+
+Guards: regular files only, nlink=1, no RENAME_EXCHANGE,
+no RENAME_WHITEOUT.
+
+Uses zero-sentinel logic (same as Btrfs): source with ptime=0
+inherits non-zero target ptime.
+
+Ref: Decision #51 (rename-over preservation on all 5 filesystems)
+Files: fs/ext4/namei.c:ext4_rename
+---
+ fs/ext4/namei.c | 13 +++++++++++++
+ 1 file changed, 13 insertions(+)
+
+diff --git a/fs/ext4/namei.c b/fs/ext4/namei.c
+index c4b5e252af0e..1bfe4df2423e 100644
+--- a/fs/ext4/namei.c
++++ b/fs/ext4/namei.c
+@@ -3942,6 +3942,19 @@ static int ext4_rename(struct mnt_idmap *idmap, struct inode *old_dir,
+ 	 * rename.
+ 	 */
+ 	inode_set_ctime_current(old.inode);
++
++	/* ptime rename-over: preserve ptime across atomic saves */
++	if (new.inode && S_ISREG(old.inode->i_mode) &&
++	    S_ISREG(new.inode->i_mode) && old.inode->i_nlink == 1 &&
++	    !(flags & RENAME_WHITEOUT)) {
++		struct ext4_inode_info *old_ei = EXT4_I(old.inode);
++		struct ext4_inode_info *new_ei = EXT4_I(new.inode);
++
++		if (!old_ei->i_ptime.tv_sec && !old_ei->i_ptime.tv_nsec &&
++		    (new_ei->i_ptime.tv_sec || new_ei->i_ptime.tv_nsec))
++			old_ei->i_ptime = new_ei->i_ptime;
++	}
++
+ 	retval = ext4_mark_inode_dirty(handle, old.inode);
+ 	if (unlikely(retval))
+ 		goto end_rename;
+-- 
+2.51.0.windows.1
+

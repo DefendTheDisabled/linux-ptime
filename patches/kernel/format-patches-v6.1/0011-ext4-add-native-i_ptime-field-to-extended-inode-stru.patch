@@ -1,0 +1,122 @@
+From c7628af716f5012b72529101763bcb254426e8d3 Mon Sep 17 00:00:00 2001
+From: Sean Smith <DefendTheDisabled@gmail.com>
+Date: Thu, 9 Apr 2026 16:00:52 -0500
+Subject: [PATCH 11/16] ext4: add native i_ptime field to extended inode
+ structure
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Adds a dedicated __le32 i_ptime + i_ptime_extra field to the
+ext4 extended inode structure, preserving the existing i_crtime
+as an immutable forensic timestamp.
+
+ext4's extended inode (256-byte inodes, modern default) contains
+after the 128-byte core: atime_extra, mtime_extra, ctime_extra,
+crtime (+crtime_extra), and then free space for future
+extensions. We place i_ptime + i_ptime_extra in that free space.
+
+On legacy 128-byte inodes, ptime cannot be persisted — the extra
+inode area is absent. ext4_setattr still accepts the ATTR_PTIME
+write into memory (EXT4_I(inode)->i_ptime is updated), but
+ext4_do_update_inode has no disk location to persist it. The
+value is lost on unmount. Similarly, ext4_getattr on legacy
+inodes reports no ptime. This is silent degradation, not an
+error path.
+
+The "native" architecture choice (separate i_ptime, not mapped
+to i_crtime) aligns with Ts'o's 2025 concept and preserves the
+forensic guarantee that i_crtime is immutable. This matches
+Decision #49's native/mapped split: ext4 is native because it's
+a Linux-first filesystem.
+
+Read/write paths:
+- ext4_setattr: handle ATTR_PTIME by writing to ei->i_ptime
+- ext4_getattr: copy ei->i_ptime to kstat.ptime when requested
+- ext4_do_update_inode: persist i_ptime to on-disk inode via
+  EXT4_EINODE_SET_XTIME macro (same pattern as crtime)
+- __ext4_iget: read i_ptime from on-disk inode via
+  EXT4_EINODE_GET_XTIME macro
+
+Ref: Decision #50 (ext4 separate i_ptime, not mapped to i_crtime)
+Ref: Decision #44 (ext4 in scope)
+Files: fs/ext4/ext4.h (struct ext4_inode_info, struct ext4_inode)
+Files: fs/ext4/inode.c:ext4_getattr
+Files: fs/ext4/inode.c:ext4_setattr
+Files: fs/ext4/inode.c:ext4_do_update_inode
+Files: fs/ext4/inode.c:__ext4_iget
+---
+ fs/ext4/ext4.h  |  3 +++
+ fs/ext4/inode.c | 14 ++++++++++++++
+ 2 files changed, 17 insertions(+)
+
+diff --git a/fs/ext4/ext4.h b/fs/ext4/ext4.h
+index f1c476303f3a..5c281263703d 100644
+--- a/fs/ext4/ext4.h
++++ b/fs/ext4/ext4.h
+@@ -860,6 +860,8 @@ struct ext4_inode {
+ 	__le32  i_crtime_extra; /* extra FileCreationtime (nsec << 2 | epoch) */
+ 	__le32  i_version_hi;	/* high 32 bits for 64-bit version */
+ 	__le32	i_projid;	/* Project ID */
++	__le32	i_ptime;		/* Provenance time */
++	__le32	i_ptime_extra;	/* extra Provenance time (nsec << 2 | epoch) */
+ };
+ 
+ #define EXT4_EPOCH_BITS 2
+@@ -1136,6 +1138,7 @@ struct ext4_inode_info {
+ 	 * struct timespec64 i_{a,c,m}time in the generic inode.
+ 	 */
+ 	struct timespec64 i_crtime;
++	struct timespec64 i_ptime;
+ 
+ 	/* mballoc */
+ 	atomic_t i_prealloc_active;
+diff --git a/fs/ext4/inode.c b/fs/ext4/inode.c
+index 625cfbf61582..15b6b6dc6124 100644
+--- a/fs/ext4/inode.c
++++ b/fs/ext4/inode.c
+@@ -4753,6 +4753,7 @@ static int ext4_fill_raw_inode(struct inode *inode, struct ext4_inode *raw_inode
+ 	EXT4_INODE_SET_MTIME(inode, raw_inode);
+ 	EXT4_INODE_SET_ATIME(inode, raw_inode);
+ 	EXT4_EINODE_SET_XTIME(i_crtime, ei, raw_inode);
++	EXT4_EINODE_SET_XTIME(i_ptime, ei, raw_inode);
+ 
+ 	raw_inode->i_dtime = cpu_to_le32(ei->i_dtime);
+ 	raw_inode->i_flags = cpu_to_le32(ei->i_flags & 0xFFFFFFFF);
+@@ -5409,6 +5410,7 @@ struct inode *__ext4_iget(struct super_block *sb, unsigned long ino,
+ 	EXT4_INODE_GET_ATIME(inode, raw_inode);
+ 	EXT4_INODE_GET_MTIME(inode, raw_inode);
+ 	EXT4_EINODE_GET_XTIME(i_crtime, ei, raw_inode);
++	EXT4_EINODE_GET_XTIME(i_ptime, ei, raw_inode);
+ 
+ 	if (likely(!test_opt2(inode->i_sb, HURD_COMPAT))) {
+ 		u64 ivers = le32_to_cpu(raw_inode->i_disk_version);
+@@ -6061,6 +6063,9 @@ int ext4_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
+ 	if (!error) {
+ 		if (inc_ivers)
+ 			inode_inc_iversion(inode);
++		if (attr->ia_valid & ATTR_PTIME)
++			EXT4_I(inode)->i_ptime = attr->ia_ptime;
++
+ 		setattr_copy(idmap, inode, attr);
+ 		mark_inode_dirty(inode);
+ 	}
+@@ -6114,6 +6119,15 @@ int ext4_getattr(struct mnt_idmap *idmap, const struct path *path,
+ 		stat->btime.tv_nsec = ei->i_crtime.tv_nsec;
+ 	}
+ 
++	/* Report ptime from dedicated field, not crtime */
++	if ((request_mask & STATX_PTIME) &&
++	    EXT4_FITS_IN_INODE(raw_inode, ei, i_ptime) &&
++	    (ei->i_ptime.tv_sec || ei->i_ptime.tv_nsec)) {
++		stat->result_mask |= STATX_PTIME;
++		stat->ptime.tv_sec = ei->i_ptime.tv_sec;
++		stat->ptime.tv_nsec = ei->i_ptime.tv_nsec;
++	}
++
+ 	/*
+ 	 * Return the DIO alignment restrictions if requested.  We only return
+ 	 * this information when requested, since on encrypted files it might
+-- 
+2.51.0.windows.1
+

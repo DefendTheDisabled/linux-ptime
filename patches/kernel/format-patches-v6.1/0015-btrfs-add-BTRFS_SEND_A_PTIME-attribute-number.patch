@@ -1,0 +1,54 @@
+From 19b19f39fd6a907078f999648faa584cde331c74 Mon Sep 17 00:00:00 2001
+From: Sean Smith <DefendTheDisabled@gmail.com>
+Date: Thu, 9 Apr 2026 20:20:50 -0500
+Subject: [PATCH 15/16] btrfs: add BTRFS_SEND_A_PTIME attribute number
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Adds BTRFS_SEND_A_PTIME = 36 to the send-stream attribute enum
+and bumps __BTRFS_SEND_A_MAX from 35 to 36. BTRFS_SEND_A_MAX_V3
+remains 35 — ptime is a v2+-gated extension that sits outside
+the historical v3 attribute bucket (see the inline comment
+added here), matching how OTIME was retrofitted into the v1
+numbering space but only emitted from v2 onward.
+
+This does NOT introduce a new send_stream protocol version.
+The attribute is gated at emission by the existing
+sctx->proto >= 2 check (the same gate as BTRFS_SEND_A_OTIME).
+A v1 stream omits ptime entirely. Patched receivers parse
+ptime when present; unpatched receivers reject the unknown
+attribute number (userspace TLV parser hard-fails on
+attr > __BTRFS_SEND_A_MAX). This is the documented
+compatibility boundary for local btrbk deployments where
+both sender and receiver are patched.
+
+Ref: Decision #78 (Btrfs send/receive ptime patch)
+Files: fs/btrfs/send.h (BTRFS_SEND_A_PTIME, __BTRFS_SEND_A_MAX)
+---
+ fs/btrfs/send.h | 9 ++++++++-
+ 1 file changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/fs/btrfs/send.h b/fs/btrfs/send.h
+index 652bb28f63d4..b00033ea0fd6 100644
+--- a/fs/btrfs/send.h
++++ b/fs/btrfs/send.h
+@@ -179,7 +179,14 @@ enum {
+ 	BTRFS_SEND_A_VERITY_SIG_DATA	= 35,
+ 	BTRFS_SEND_A_MAX_V3		= 35,
+ 
+-	__BTRFS_SEND_A_MAX		= 35,
++	/*
++	 * Provenance time extension. Added after v3; gated at
++	 * emission by sctx->proto >= 2 (matches OTIME pattern).
++	 * Not part of the v1/v2/v3 version buckets.
++	 */
++	BTRFS_SEND_A_PTIME		= 36,
++
++	__BTRFS_SEND_A_MAX		= 36,
+ };
+ 
+ long btrfs_ioctl_send(struct btrfs_root *send_root, const struct btrfs_ioctl_send_args *arg);
+-- 
+2.51.0.windows.1
+

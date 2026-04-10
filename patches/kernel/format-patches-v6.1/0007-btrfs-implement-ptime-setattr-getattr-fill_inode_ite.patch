@@ -1,0 +1,114 @@
+From f6ee1b875ff1479f2806af6789e1b20dedfeaafc Mon Sep 17 00:00:00 2001
+From: Sean Smith <DefendTheDisabled@gmail.com>
+Date: Thu, 9 Apr 2026 15:59:45 -0500
+Subject: [PATCH 07/16] btrfs: implement ptime setattr, getattr,
+ fill_inode_item
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Wires btrfs into the VFS ptime infrastructure through the
+non-delayed inode.c paths:
+
+- btrfs_setattr handles ATTR_PTIME by writing attr->ia_ptime to
+  BTRFS_I(inode)->i_ptime_{sec,nsec}. Calls setattr_copy and
+  btrfs_dirty_inode, which eventually persists via the delayed
+  path (commit B3) or the direct path below.
+
+- btrfs_getattr responds to STATX_PTIME requests by copying the
+  in-memory ptime to stat->ptime. Only sets result_mask when
+  ptime is non-zero (sentinel: 0 means "no ptime set"). Placed
+  alongside the existing STATX_BTIME handling.
+
+- btrfs_read_locked_inode reads ptime from the inode_item leaf
+  to btrfs_inode on fresh inode loads via the non-delayed path.
+  Used for free-space inodes, relocation roots, log recovery,
+  and ENOSPC fallback — all cases where btrfs_fill_inode is
+  bypassed. Complement to the delayed path in B3.
+
+- fill_inode_item (static helper from btrfs_update_inode_item)
+  writes ptime from btrfs_inode to the inode_item leaf on
+  direct updates. Complements the delayed path for cases that
+  bypass delayed-inode batching.
+
+- btrfs_alloc_inode zeroes ptime on new inode init. New files
+  start with ptime=0 (sentinel, treated as "no ptime"). Explicit
+  ptime is set either by user tools or by cross-filesystem copy
+  operations.
+
+Ref: Decision #49 (native ptime for btrfs)
+Files: fs/btrfs/inode.c:btrfs_setattr
+Files: fs/btrfs/inode.c:btrfs_getattr
+Files: fs/btrfs/inode.c:btrfs_read_locked_inode
+Files: fs/btrfs/inode.c:fill_inode_item
+Files: fs/btrfs/inode.c:btrfs_alloc_inode
+---
+ fs/btrfs/inode.c | 24 +++++++++++++++++++++++-
+ 1 file changed, 23 insertions(+), 1 deletion(-)
+
+diff --git a/fs/btrfs/inode.c b/fs/btrfs/inode.c
+index 13f1f3b52b04..55d4e6e367ef 100644
+--- a/fs/btrfs/inode.c
++++ b/fs/btrfs/inode.c
+@@ -4029,6 +4029,8 @@ static int btrfs_read_locked_inode(struct btrfs_inode *inode, struct btrfs_path
+ 
+ 	inode->i_otime_sec = btrfs_timespec_sec(leaf, &inode_item->otime);
+ 	inode->i_otime_nsec = btrfs_timespec_nsec(leaf, &inode_item->otime);
++	inode->i_ptime_sec = btrfs_timespec_sec(leaf, &inode_item->ptime);
++	inode->i_ptime_nsec = btrfs_timespec_nsec(leaf, &inode_item->ptime);
+ 
+ 	inode_set_bytes(vfs_inode, btrfs_inode_nbytes(leaf, inode_item));
+ 	inode->generation = btrfs_inode_generation(leaf, inode_item);
+@@ -4220,6 +4222,8 @@ static void fill_inode_item(struct btrfs_trans_handle *trans,
+ 
+ 	btrfs_set_timespec_sec(leaf, &item->otime, BTRFS_I(inode)->i_otime_sec);
+ 	btrfs_set_timespec_nsec(leaf, &item->otime, BTRFS_I(inode)->i_otime_nsec);
++	btrfs_set_timespec_sec(leaf, &item->ptime, BTRFS_I(inode)->i_ptime_sec);
++	btrfs_set_timespec_nsec(leaf, &item->ptime, BTRFS_I(inode)->i_ptime_nsec);
+ 
+ 	btrfs_set_inode_nbytes(leaf, item, inode_get_bytes(inode));
+ 	btrfs_set_inode_generation(leaf, item, BTRFS_I(inode)->generation);
+@@ -5424,7 +5428,15 @@ static int btrfs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
+ 	}
+ 
+ 	if (attr->ia_valid) {
+-		setattr_copy(idmap, inode, attr);
++		if (attr->ia_valid & ATTR_PTIME) {
++			BTRFS_I(inode)->i_ptime_sec = attr->ia_ptime.tv_sec;
++			BTRFS_I(inode)->i_ptime_nsec = attr->ia_ptime.tv_nsec;
++			/* COMPAT_RO_PTIME disabled for local deployment.
++			 * Re-enable for upstream submission to protect
++			 * against old kernels zeroing ptime on RW mount. */
++		}
++
++	setattr_copy(idmap, inode, attr);
+ 		inode_inc_iversion(inode);
+ 		ret = btrfs_dirty_inode(BTRFS_I(inode));
+ 
+@@ -8007,6 +8019,8 @@ struct inode *btrfs_alloc_inode(struct super_block *sb)
+ 
+ 	ei->i_otime_sec = 0;
+ 	ei->i_otime_nsec = 0;
++	ei->i_ptime_sec = 0;
++	ei->i_ptime_nsec = 0;
+ 
+ 	inode = &ei->vfs_inode;
+ 	btrfs_extent_map_tree_init(&ei->extent_tree);
+@@ -8159,6 +8173,14 @@ static int btrfs_getattr(struct mnt_idmap *idmap,
+ 	u32 bi_ro_flags = BTRFS_I(inode)->ro_flags;
+ 
+ 	stat->result_mask |= STATX_BTIME;
++	if (request_mask & STATX_PTIME) {
++		if (BTRFS_I(inode)->i_ptime_sec ||
++		    BTRFS_I(inode)->i_ptime_nsec) {
++			stat->ptime.tv_sec = BTRFS_I(inode)->i_ptime_sec;
++			stat->ptime.tv_nsec = BTRFS_I(inode)->i_ptime_nsec;
++			stat->result_mask |= STATX_PTIME;
++		}
++	}
+ 	stat->btime.tv_sec = BTRFS_I(inode)->i_otime_sec;
+ 	stat->btime.tv_nsec = BTRFS_I(inode)->i_otime_nsec;
+ 	if (bi_flags & BTRFS_INODE_APPEND)
+-- 
+2.51.0.windows.1
+

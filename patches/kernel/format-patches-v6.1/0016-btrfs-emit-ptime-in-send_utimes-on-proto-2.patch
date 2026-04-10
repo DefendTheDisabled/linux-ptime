@@ -1,0 +1,72 @@
+From d2de477a7233df4dd18c8c84ad0f29edb41b7bf4 Mon Sep 17 00:00:00 2001
+From: Sean Smith <DefendTheDisabled@gmail.com>
+Date: Thu, 9 Apr 2026 20:21:32 -0500
+Subject: [PATCH 16/16] btrfs: emit ptime in send_utimes on proto >= 2
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Extends send_utimes() to emit BTRFS_SEND_A_PTIME after the
+existing OTIME emission when sctx->proto >= 2. The emission is
+UNCONDITIONAL within the proto >= 2 block — a patched sender
+always advertises ptime, including zero values, so that an
+incremental receive can distinguish "ptime unchanged from
+parent snapshot" (no UTIMES emitted) from "ptime explicitly
+cleared" (UTIMES emitted with ptime=0).
+
+Rationale for unconditional emission: if send_utimes skipped
+PTIME when ii->ptime == 0, a child snapshot that explicitly
+cleared ptime on a file would look identical on the wire to
+a child snapshot that didn't touch ptime at all. The receiver
+would then leave the parent's nonzero ptime on the destination
+file — a correctness bug for btrbk's primary use case.
+
+All send_utimes() call sites (cache_dir_utimes,
+trim_dir_utimes_cache, finish_inode_if_needed,
+apply_dir_utimes) funnel through the single btrfs_item_ptr
+read at send.c:2705, so the TLV emission is added in exactly
+one place and covers both file and directory ptime.
+
+The TLV emission uses the existing TLV_PUT_BTRFS_TIMESPEC
+macro with &ii->ptime as the source. Placement is inside the
+existing proto >= 2 block, after OTIME, matching the
+chronological order of stream-format extensions.
+
+Wire overhead: approximately 16 bytes per UTIMES command
+(TLV header + 12 bytes btrfs_timespec). Only present on
+proto >= 2 streams.
+
+Ref: Decision #78 (Btrfs send/receive ptime patch)
+Ref: fs/btrfs/send.h:BTRFS_SEND_A_PTIME (prior commit)
+Files: fs/btrfs/send.c:send_utimes (TLV_PUT block after OTIME)
+---
+ fs/btrfs/send.c | 12 +++++++++++-
+ 1 file changed, 11 insertions(+), 1 deletion(-)
+
+diff --git a/fs/btrfs/send.c b/fs/btrfs/send.c
+index d8127a7120c2..ff44e3ec2c1e 100644
+--- a/fs/btrfs/send.c
++++ b/fs/btrfs/send.c
+@@ -2712,8 +2712,18 @@ static int send_utimes(struct send_ctx *sctx, u64 ino, u64 gen)
+ 	TLV_PUT_BTRFS_TIMESPEC(sctx, BTRFS_SEND_A_ATIME, eb, &ii->atime);
+ 	TLV_PUT_BTRFS_TIMESPEC(sctx, BTRFS_SEND_A_MTIME, eb, &ii->mtime);
+ 	TLV_PUT_BTRFS_TIMESPEC(sctx, BTRFS_SEND_A_CTIME, eb, &ii->ctime);
+-	if (sctx->proto >= 2)
++	if (sctx->proto >= 2) {
+ 		TLV_PUT_BTRFS_TIMESPEC(sctx, BTRFS_SEND_A_OTIME, eb, &ii->otime);
++		/*
++		 * Emit ptime unconditionally on proto >= 2. A patched
++		 * sender always advertises ptime (including zero values)
++		 * so incremental receive can distinguish "ptime unchanged
++		 * from parent" (no UTIMES at all) from "ptime explicitly
++		 * cleared" (UTIMES with ptime == 0). Sentinel gating here
++		 * would conflate those two cases on the receiver side.
++		 */
++		TLV_PUT_BTRFS_TIMESPEC(sctx, BTRFS_SEND_A_PTIME, eb, &ii->ptime);
++	}
+ 
+ 	ret = send_cmd(sctx);
+ 
+-- 
+2.51.0.windows.1
+

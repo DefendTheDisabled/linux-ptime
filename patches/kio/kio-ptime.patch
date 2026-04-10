@@ -1,0 +1,316 @@
+diff -ruN '--exclude=*.o' '--exclude=*.so' '--exclude=CMakeFiles' '--exclude=cmake_install*' '--exclude=CMakeCache*' '--exclude=Makefile' '--exclude=.cmake' '--exclude=moc_*' '--exclude=*.a' '--exclude=autogen' '--exclude=build' /tmp/kio-6.24.0/.clang-format /home/sean/ptime-build/kio/kio/src/kio-6.24.0/.clang-format
+--- /tmp/kio-6.24.0/.clang-format	1969-12-31 18:00:00.000000000 -0600
++++ /home/sean/ptime-build/kio/kio/src/kio-6.24.0/.clang-format	2026-04-04 12:48:33.230787865 -0500
+@@ -0,0 +1,95 @@
++---
++# SPDX-FileCopyrightText: 2019 Christoph Cullmann <cullmann@kde.org>
++# SPDX-FileCopyrightText: 2019 Gernot Gebhard <gebhard@absint.com>
++#
++# SPDX-License-Identifier: MIT
++
++# This file got automatically created by ECM, do not edit
++# See https://clang.llvm.org/docs/ClangFormatStyleOptions.html for the config options
++# and https://community.kde.org/Policies/Frameworks_Coding_Style#Clang-format_automatic_code_formatting
++# for clang-format tips & tricks
++---
++Language: JavaScript
++DisableFormat: true
++---
++Language: Json
++DisableFormat: false
++IndentWidth: 4
++---
++
++# Style for C++
++Language: Cpp
++
++# base is WebKit coding style: https://webkit.org/code-style-guidelines/
++# below are only things set that diverge from this style!
++BasedOnStyle: WebKit
++
++# enforce C++11 (e.g. for std::vector<std::vector<lala>>
++Standard: Cpp11
++
++# 4 spaces indent
++TabWidth: 4
++
++# 2 * 80 wide lines
++ColumnLimit: 160
++
++# sort includes inside line separated groups
++SortIncludes: true
++
++# break before braces on function, namespace and class definitions.
++BreakBeforeBraces: Linux
++
++# CrlInstruction *a;
++PointerAlignment: Right
++
++# horizontally aligns arguments after an open bracket.
++AlignAfterOpenBracket: Align
++
++# don't move all parameters to new line
++AllowAllParametersOfDeclarationOnNextLine: false
++
++# no single line functions
++AllowShortFunctionsOnASingleLine: None
++
++# no single line enums
++AllowShortEnumsOnASingleLine: false
++
++# always break before you encounter multi line strings
++AlwaysBreakBeforeMultilineStrings: true
++
++# don't move arguments to own lines if they are not all on the same
++BinPackArguments: false
++
++# don't move parameters to own lines if they are not all on the same
++BinPackParameters: false
++
++# In case we have an if statement with multiple lines the operator should be at the beginning of the line
++# but we do not want to break assignments
++BreakBeforeBinaryOperators: NonAssignment
++
++# format C++11 braced lists like function calls
++Cpp11BracedListStyle: true
++
++# do not put a space before C++11 braced lists
++SpaceBeforeCpp11BracedList: false
++
++# remove empty lines
++KeepEmptyLinesAtTheStartOfBlocks: false
++
++# no namespace indentation to keep indent level low
++NamespaceIndentation: None
++
++# we use template< without space.
++SpaceAfterTemplateKeyword: false
++
++# Always break after template declaration
++AlwaysBreakTemplateDeclarations: true
++
++# macros for which the opening brace stays attached.
++ForEachMacros: [ foreach, Q_FOREACH, BOOST_FOREACH, forever, Q_FOREVER, QBENCHMARK, QBENCHMARK_ONCE , wl_resource_for_each, wl_resource_for_each_safe ]
++
++# keep lambda formatting multi-line if not empty
++AllowShortLambdasOnASingleLine: Empty
++
++# We do not want clang-format to put all arguments on a new line
++AllowAllArgumentsOnNextLine: false
+diff -ruN '--exclude=*.o' '--exclude=*.so' '--exclude=CMakeFiles' '--exclude=cmake_install*' '--exclude=CMakeCache*' '--exclude=Makefile' '--exclude=.cmake' '--exclude=moc_*' '--exclude=*.a' '--exclude=autogen' '--exclude=build' /tmp/kio-6.24.0/src/core/copyjob.cpp /home/sean/ptime-build/kio/kio/src/kio-6.24.0/src/core/copyjob.cpp
+--- /tmp/kio-6.24.0/src/core/copyjob.cpp	2026-03-07 14:31:18.000000000 -0600
++++ /home/sean/ptime-build/kio/kio/src/kio-6.24.0/src/core/copyjob.cpp	2026-04-07 10:05:07.025934609 -0500
+@@ -23,6 +23,12 @@
+ #include "statjob.h"
+ #include <cerrno>
+ 
++#ifdef Q_OS_LINUX
++#include <sys/syscall.h>
++#include <stdint.h>
++#include <string.h>
++#endif
++
+ #include <KConfigGroup>
+ #include <KDesktopFile>
+ #include <KLocalizedString>
+@@ -2173,10 +2179,43 @@
+         ++m_directoriesCopiedIterator;
+     }
+     if (m_directoriesCopiedIterator != m_directoriesCopied.cend()) {
++        const QUrl uSource = (*m_directoriesCopiedIterator).uSource;
+         const QUrl url = (*m_directoriesCopiedIterator).uDest;
+         const QDateTime dt = (*m_directoriesCopiedIterator).mtime;
+         ++m_directoriesCopiedIterator;
+ 
++#ifdef Q_OS_LINUX
++        // Preserve provenance time (ptime) from source directory.
++        // Uses raw syscall since system headers don't have stx_ptime yet.
++        if (uSource.isLocalFile() && url.isLocalFile()) {
++            const QByteArray srcPath = uSource.toLocalFile().toLocal8Bit();
++            const QByteArray dstPath = url.toLocalFile().toLocal8Bit();
++            char stxbuf[256];
++            memset(stxbuf, 0, 256);
++            if (syscall(SYS_statx, AT_FDCWD, srcPath.constData(),
++                        0 /* follow symlinks */, 0x00040000U /* STATX_PTIME */,
++                        stxbuf) == 0) {
++                uint32_t mask;
++                memcpy(&mask, stxbuf, 4);
++                if (mask & 0x00040000U) {
++                    int64_t ptime_sec;
++                    int32_t ptime_nsec;
++                    memcpy(&ptime_sec, stxbuf + 0xC0, 8);
++                    memcpy(&ptime_nsec, stxbuf + 0xC8, 4);
++                    if (ptime_sec || ptime_nsec) {
++                        /* Write ptime via file_setattr (syscall 469) */
++                        char fa[40];
++                        memset(fa, 0, 40);
++                        memcpy(fa + 24, &ptime_sec, 8);
++                        memcpy(fa + 32, &ptime_nsec, 4);
++                        syscall(469 /* SYS_file_setattr */, AT_FDCWD,
++                                dstPath.constData(), fa, (size_t)40, 0);
++                    }
++                }
++            }
++        }
++#endif
++
+         KIO::SimpleJob *job = KIO::setModificationTime(url, dt);
+         job->setParentJob(q);
+         q->addSubjob(job);
+diff -ruN '--exclude=*.o' '--exclude=*.so' '--exclude=CMakeFiles' '--exclude=cmake_install*' '--exclude=CMakeCache*' '--exclude=Makefile' '--exclude=.cmake' '--exclude=moc_*' '--exclude=*.a' '--exclude=autogen' '--exclude=build' /tmp/kio-6.24.0/src/core/kfileitem.cpp /home/sean/ptime-build/kio/kio/src/kio-6.24.0/src/core/kfileitem.cpp
+--- /tmp/kio-6.24.0/src/core/kfileitem.cpp	2026-03-07 14:31:18.000000000 -0600
++++ /home/sean/ptime-build/kio/kio/src/kio-6.24.0/src/core/kfileitem.cpp	2026-04-05 15:02:25.582161849 -0500
+@@ -398,6 +398,8 @@
+         return KIO::UDSEntry::UDS_ACCESS_TIME;
+     case KFileItem::CreationTime:
+         return KIO::UDSEntry::UDS_CREATION_TIME;
++    case KFileItem::ProvenanceTime:
++        return KIO::UDSEntry::UDS_PROVENANCE_TIME;
+     }
+     return 0;
+ }
+@@ -411,6 +413,8 @@
+         return KIO::UDSEntry::UDS_ACCESS_TIME_NS_OFFSET;
+     case KFileItem::CreationTime:
+         return KIO::UDSEntry::UDS_CREATION_TIME_NS_OFFSET;
++    case KFileItem::ProvenanceTime:
++        return KIO::UDSEntry::UDS_PROVENANCE_TIME_NS_OFFSET;
+     }
+     return 0;
+ }
+diff -ruN '--exclude=*.o' '--exclude=*.so' '--exclude=CMakeFiles' '--exclude=cmake_install*' '--exclude=CMakeCache*' '--exclude=Makefile' '--exclude=.cmake' '--exclude=moc_*' '--exclude=*.a' '--exclude=autogen' '--exclude=build' /tmp/kio-6.24.0/src/core/kfileitem.h /home/sean/ptime-build/kio/kio/src/kio-6.24.0/src/core/kfileitem.h
+--- /tmp/kio-6.24.0/src/core/kfileitem.h	2026-03-07 14:31:18.000000000 -0600
++++ /home/sean/ptime-build/kio/kio/src/kio-6.24.0/src/core/kfileitem.h	2026-04-05 15:02:25.582422649 -0500
+@@ -195,6 +195,7 @@
+         ModificationTime = 0,
+         AccessTime = 1,
+         CreationTime = 2,
++        ProvenanceTime = 3,
+         // ChangeTime
+     };
+     Q_ENUM(FileTimes)
+diff -ruN '--exclude=*.o' '--exclude=*.so' '--exclude=CMakeFiles' '--exclude=cmake_install*' '--exclude=CMakeCache*' '--exclude=Makefile' '--exclude=.cmake' '--exclude=moc_*' '--exclude=*.a' '--exclude=autogen' '--exclude=build' /tmp/kio-6.24.0/src/core/udsentry.h /home/sean/ptime-build/kio/kio/src/kio-6.24.0/src/core/udsentry.h
+--- /tmp/kio-6.24.0/src/core/udsentry.h	2026-03-07 14:31:18.000000000 -0600
++++ /home/sean/ptime-build/kio/kio/src/kio-6.24.0/src/core/udsentry.h	2026-04-05 15:02:25.582536750 -0500
+@@ -302,6 +302,8 @@
+         UDS_MODIFICATION_TIME_NS_OFFSET = 34 | UDS_NUMBER,
+         UDS_ACCESS_TIME_NS_OFFSET = 35 | UDS_NUMBER,
+         UDS_CREATION_TIME_NS_OFFSET = 36 | UDS_NUMBER,
++        UDS_PROVENANCE_TIME = 37 | UDS_TIME,
++        UDS_PROVENANCE_TIME_NS_OFFSET = 38 | UDS_NUMBER,
+         UDS_EXTRA = 100 | UDS_STRING,
+         UDS_EXTRA_END = 140 | UDS_STRING,
+     };
+diff -ruN '--exclude=*.o' '--exclude=*.so' '--exclude=CMakeFiles' '--exclude=cmake_install*' '--exclude=CMakeCache*' '--exclude=Makefile' '--exclude=.cmake' '--exclude=moc_*' '--exclude=*.a' '--exclude=autogen' '--exclude=build' /tmp/kio-6.24.0/src/kioworkers/file/file_unix.cpp /home/sean/ptime-build/kio/kio/src/kio-6.24.0/src/kioworkers/file/file_unix.cpp
+--- /tmp/kio-6.24.0/src/kioworkers/file/file_unix.cpp	2026-03-07 14:31:18.000000000 -0600
++++ /home/sean/ptime-build/kio/kio/src/kio-6.24.0/src/kioworkers/file/file_unix.cpp	2026-04-07 16:44:13.606387127 -0500
+@@ -44,6 +44,10 @@
+ #include <linux/fs.h>
+ #include <sys/ioctl.h>
+ #include <unistd.h>
++#ifdef Q_OS_LINUX
++#include <sys/syscall.h>
++#include <stdint.h>
++#endif
+ 
+ #endif // Q_OS_LINUX
+ 
+@@ -289,6 +293,33 @@
+             }
+         }
+ #endif
++
++#ifdef Q_OS_LINUX
++        // Provenance time (ptime) — custom kernel timestamp.
++        // Uses raw syscall since system headers don't have stx_ptime yet.
++        {
++            char stxbuf[256];
++            memset(stxbuf, 0, 256);
++            if (syscall(SYS_statx, AT_FDCWD, path.constData(),
++                        0 /* follow symlinks */, 0x00040000U /* STATX_PTIME */,
++                        stxbuf) == 0) {
++                uint32_t mask;
++                memcpy(&mask, stxbuf, 4);
++                if (mask & 0x00040000U) {
++                    int64_t ptime_sec;
++                    int32_t ptime_nsec;
++                    memcpy(&ptime_sec, stxbuf + 0xC0, 8);
++                    memcpy(&ptime_nsec, stxbuf + 0xC8, 4);
++                    if (ptime_sec > 0) {
++                        entry.fastInsert(KIO::UDSEntry::UDS_PROVENANCE_TIME, ptime_sec);
++                        if ((details & KIO::StatTimeNsOffset) == KIO::StatTimeNsOffset) {
++                            entry.fastInsert(KIO::UDSEntry::UDS_PROVENANCE_TIME_NS_OFFSET, ptime_nsec / 1000000);
++                        }
++                    }
++                }
++            }
++        }
++#endif
+     }
+ 
+     if (details & KIO::StatInode) {
+@@ -675,6 +706,38 @@
+ #endif
+             qCWarning(KIO_FILE) << "Couldn't preserve access and modification time for" << dest;
+         }
++
++#ifdef Q_OS_LINUX
++        // Preserve provenance time (ptime) if source has it.
++        // Uses raw syscall since system headers don't know about ptime yet.
++        {
++            char stxbuf[256];
++            memset(stxbuf, 0, 256);
++            if (syscall(SYS_statx, AT_FDCWD, _src.data(),
++                        0 /* follow symlinks */, 0x00040000U /* STATX_PTIME */,
++                        stxbuf) == 0) {
++                uint32_t mask;
++                memcpy(&mask, stxbuf, 4);
++                if (mask & 0x00040000U) {
++                    int64_t ptime_sec;
++                    int32_t ptime_nsec;
++                    memcpy(&ptime_sec, stxbuf + 0xC0, 8);  // stx_ptime.tv_sec
++                    memcpy(&ptime_nsec, stxbuf + 0xC8, 4);  // stx_ptime.tv_nsec
++                    if (ptime_sec || ptime_nsec) {
++                        // Write ptime via file_setattr (syscall 469)
++                        char fa[40];
++                        memset(fa, 0, 40);
++                        memcpy(fa + 24, &ptime_sec, 8);
++                        memcpy(fa + 32, &ptime_nsec, 4);
++                        if (syscall(469 /* SYS_file_setattr */, AT_FDCWD,
++                                    _dest.data(), fa, (size_t)40, 0) != 0) {
++                            qCDebug(KIO_FILE) << "Could not preserve provenance time for" << dest;
++                        }
++                    }
++                }
++            }
++        }
++#endif
+     }
+ 
+     destFile.close();
+diff -ruN '--exclude=*.o' '--exclude=*.so' '--exclude=CMakeFiles' '--exclude=cmake_install*' '--exclude=CMakeCache*' '--exclude=Makefile' '--exclude=.cmake' '--exclude=moc_*' '--exclude=*.a' '--exclude=autogen' '--exclude=build' /tmp/kio-6.24.0/src/widgets/kpropertiesdialogbuiltin_p.cpp /home/sean/ptime-build/kio/kio/src/kio-6.24.0/src/widgets/kpropertiesdialogbuiltin_p.cpp
+--- /tmp/kio-6.24.0/src/widgets/kpropertiesdialogbuiltin_p.cpp	2026-03-07 14:31:18.000000000 -0600
++++ /home/sean/ptime-build/kio/kio/src/kio-6.24.0/src/widgets/kpropertiesdialogbuiltin_p.cpp	2026-04-05 15:02:25.582902891 -0500
+@@ -500,6 +500,13 @@
+             d->m_ui->accessTimeLabel->hide();
+             d->m_ui->accessTimeLabel_Left->hide();
+         }
++
++        if (const QString timeString = firstItem.timeString(KFileItem::ProvenanceTime); !timeString.isEmpty()) {
++            d->m_ui->provenanceTimeLabel->setText(timeString);
++        } else {
++            d->m_ui->provenanceTimeLabel->hide();
++            d->m_ui->provenanceTimeLabel_Left->hide();
++        }
+     } else {
+         d->m_ui->createdTimeLabel->hide();
+         d->m_ui->createdTimeLabel_Left->hide();
+@@ -507,6 +514,8 @@
+         d->m_ui->modifiedTimeLabel_Left->hide();
+         d->m_ui->accessTimeLabel->hide();
+         d->m_ui->accessTimeLabel_Left->hide();
++        d->m_ui->provenanceTimeLabel->hide();
++        d->m_ui->provenanceTimeLabel_Left->hide();
+     }
+ 
+     // File system and mount point widgets

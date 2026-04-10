@@ -1,0 +1,81 @@
+From a8c4735e05e7f62be1b866120db90d9cc7b860a9 Mon Sep 17 00:00:00 2001
+From: Sean Smith <DefendTheDisabled@gmail.com>
+Date: Thu, 9 Apr 2026 15:58:36 -0500
+Subject: [PATCH 06/16] btrfs: read/write ptime via delayed-inode path
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Adds the in-memory representation of ptime in struct btrfs_inode
+(i_ptime_sec, i_ptime_nsec) and wires it into the delayed-inode
+path, which is the primary read/write route for normal inodes.
+
+Critically, normal file inodes in btrfs do NOT go through the
+straightforward fill_inode_item path. They use delayed-inode
+batching for performance. Earlier ptime versions (v1/v2) wrote
+ptime in fill_inode_item directly, which worked for newly-created
+inodes but silently dropped ptime updates on existing files.
+
+The delayed path has two sides:
+  - btrfs_fill_inode: on inode load, populates in-memory
+    btrfs_inode fields from the on-disk leaf.
+  - btrfs_fill_inode_item_for_delayed: on inode writeback,
+    populates the leaf from in-memory fields.
+
+Both sides must handle ptime for persistent storage to work.
+
+Non-delayed read/write paths (btrfs_read_locked_inode and
+fill_inode_item in fs/btrfs/inode.c) are covered in commit B4 —
+they handle free-space inodes, relocation roots, log recovery,
+and ENOSPC fallback cases.
+
+Ref: Decision #47 (iterative audit protocol — delayed-inode bug
+     discovered during audit when normal inodes failed to persist
+     ptime updates despite newly-created inodes working)
+Files: fs/btrfs/delayed-inode.c:btrfs_fill_inode
+Files: fs/btrfs/delayed-inode.c:btrfs_fill_inode_item_for_delayed
+---
+ fs/btrfs/btrfs_inode.h   | 4 ++++
+ fs/btrfs/delayed-inode.c | 4 ++++
+ 2 files changed, 8 insertions(+)
+
+diff --git a/fs/btrfs/btrfs_inode.h b/fs/btrfs/btrfs_inode.h
+index 73602ee8de3f..bac92f766833 100644
+--- a/fs/btrfs/btrfs_inode.h
++++ b/fs/btrfs/btrfs_inode.h
+@@ -334,6 +334,10 @@ struct btrfs_inode {
+ 	u64 i_otime_sec;
+ 	u32 i_otime_nsec;
+ 
++	/* Provenance time - original creation date of file content. */
++	u64 i_ptime_sec;
++	u32 i_ptime_nsec;
++
+ 	/* Hook into fs_info->delayed_iputs */
+ 	struct list_head delayed_iput;
+ 
+diff --git a/fs/btrfs/delayed-inode.c b/fs/btrfs/delayed-inode.c
+index 7e3d294a6dce..649de7c29f0d 100644
+--- a/fs/btrfs/delayed-inode.c
++++ b/fs/btrfs/delayed-inode.c
+@@ -1887,6 +1887,8 @@ static void fill_stack_inode_item(struct btrfs_trans_handle *trans,
+ 
+ 	btrfs_set_stack_timespec_sec(&inode_item->otime, inode->i_otime_sec);
+ 	btrfs_set_stack_timespec_nsec(&inode_item->otime, inode->i_otime_nsec);
++	btrfs_set_stack_timespec_sec(&inode_item->ptime, inode->i_ptime_sec);
++	btrfs_set_stack_timespec_nsec(&inode_item->ptime, inode->i_ptime_nsec);
+ }
+ 
+ int btrfs_fill_inode(struct btrfs_inode *inode, u32 *rdev)
+@@ -1935,6 +1937,8 @@ int btrfs_fill_inode(struct btrfs_inode *inode, u32 *rdev)
+ 
+ 	inode->i_otime_sec = btrfs_stack_timespec_sec(&inode_item->otime);
+ 	inode->i_otime_nsec = btrfs_stack_timespec_nsec(&inode_item->otime);
++	inode->i_ptime_sec = btrfs_stack_timespec_sec(&inode_item->ptime);
++	inode->i_ptime_nsec = btrfs_stack_timespec_nsec(&inode_item->ptime);
+ 
+ 	vfs_inode->i_generation = inode->generation;
+ 	if (S_ISDIR(vfs_inode->i_mode))
+-- 
+2.51.0.windows.1
+

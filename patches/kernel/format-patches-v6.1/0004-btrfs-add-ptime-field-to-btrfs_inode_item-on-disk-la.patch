@@ -1,0 +1,58 @@
+From 8a812655325cad635b14c72d68c9b9f719124fe5 Mon Sep 17 00:00:00 2001
+From: Sean Smith <DefendTheDisabled@gmail.com>
+Date: Thu, 9 Apr 2026 15:58:05 -0500
+Subject: [PATCH 04/16] btrfs: add ptime field to btrfs_inode_item on-disk
+ layout
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Consumes 16 bytes of the existing reserved[4] region in struct
+btrfs_inode_item: 12 bytes for struct btrfs_timespec ptime (same
+encoding as atime/mtime/ctime/otime — __le64 sec + __le32 nsec)
+plus 4 bytes for __reserved_pad to maintain 8-byte alignment of
+the remaining reserved[2].
+
+The on-disk layout change is:
+    struct btrfs_timespec ctime;
+    struct btrfs_timespec otime;
+-   __le64 reserved[4];
++   struct btrfs_timespec ptime;
++   __le32 __reserved_pad;
++   __le64 reserved[2];
+
+Backward compatibility is maintained — old kernels reading the
+inode see zeros in the ptime field and pass them through
+unchanged. When an unpatched kernel RW-mounts a filesystem with
+ptime-populated inodes, it would silently drop ptime on inode
+updates. The BTRFS_FEATURE_COMPAT_RO_PTIME feature flag (next
+commit) prevents this at mount time.
+
+This is the on-disk layout commit. In-memory representation and
+read/write paths come in following commits.
+
+Ref: Decision #44 (Btrfs is native ptime FS with separate field)
+Ref: Decision #49 (native vs mapped ptime architecture)
+Files: include/uapi/linux/btrfs_tree.h (struct btrfs_inode_item)
+---
+ include/uapi/linux/btrfs_tree.h | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/include/uapi/linux/btrfs_tree.h b/include/uapi/linux/btrfs_tree.h
+index fc29d273845d..719c00363088 100644
+--- a/include/uapi/linux/btrfs_tree.h
++++ b/include/uapi/linux/btrfs_tree.h
+@@ -890,7 +890,9 @@ struct btrfs_inode_item {
+ 	 * a little future expansion, for more than this we can
+ 	 * just grow the inode item and version it
+ 	 */
+-	__le64 reserved[4];
++	struct btrfs_timespec ptime;
++	__le32 __reserved_pad;
++	__le64 reserved[2];
+ 	struct btrfs_timespec atime;
+ 	struct btrfs_timespec ctime;
+ 	struct btrfs_timespec mtime;
+-- 
+2.51.0.windows.1
+

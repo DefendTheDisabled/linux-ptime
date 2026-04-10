@@ -1,0 +1,63 @@
+From 7a04e3aaaa9d058f416531819efdd0bbf2c37870 Mon Sep 17 00:00:00 2001
+From: Sean Smith <DefendTheDisabled@gmail.com>
+Date: Thu, 9 Apr 2026 15:57:34 -0500
+Subject: [PATCH 02/16] vfs: extend struct file_attr with ptime (VER1, 40
+ bytes)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Extends struct file_attr from VER0 (24 bytes) to VER1 (40 bytes)
+by adding ptime_sec (__s64), ptime_nsec (__u32), and ptime_pad
+(__u32 for alignment) at offsets 24, 32, 36 respectively. The
+timestamp encoding matches statx: __s64 seconds + __u32
+nanoseconds, giving ~292 billion years range and nanosecond
+precision.
+
+file_attr uses size-versioning via copy_struct_from/to_user()
+(same pattern as clone_args, mount_attr, statx). Userspace passes
+the struct size it knows about; the kernel zero-fills unknown
+trailing fields for forward compatibility. ptime is the first
+timestamp field in file_attr — prior VER0 carried only xflags,
+extsize, nextents, projid, cowextsize.
+
+Padding is required because VER1 must be a multiple of 8 bytes
+for alignment. ptime_pad is reserved and must be zero on write.
+
+This layout was confirmed with Wong (XFS maintainer) during the
+v2 migration discussion. The dual-dispatch approach in
+file_setattr keeps ptime (iattr path) separate from xflags
+(vfs_fileattr_set path) because ntfs3, FAT, and exFAT do not
+implement .fileattr_set but all implement .setattr.
+
+Ref: Decision #71 (file_attr migration per Wong's suggestion)
+Ref: Decision #72 (iattr dispatch path, not .fileattr_set)
+Ref: Wong email thread on lore.kernel.org (2026-04-07)
+---
+ include/uapi/linux/fs.h | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/include/uapi/linux/fs.h b/include/uapi/linux/fs.h
+index 66ca526cf786..d6d9cd542aea 100644
+--- a/include/uapi/linux/fs.h
++++ b/include/uapi/linux/fs.h
+@@ -229,10 +229,15 @@ struct file_attr {
+ 	__u32 fa_nextents;	/* nextents field value (get)   */
+ 	__u32 fa_projid;	/* project identifier (get/set) */
+ 	__u32 fa_cowextsize;	/* CoW extsize field value (get/set) */
++	/* ptime (provenance time) extension — VER1 */
++	__s64 fa_ptime_sec;	/* provenance time: seconds since epoch */
++	__u32 fa_ptime_nsec;	/* provenance time: nanoseconds */
++	__u32 fa_ptime_pad;	/* alignment padding */
+ };
+ 
+ #define FILE_ATTR_SIZE_VER0 24
+-#define FILE_ATTR_SIZE_LATEST FILE_ATTR_SIZE_VER0
++#define FILE_ATTR_SIZE_VER1 (FILE_ATTR_SIZE_VER0 + 16)
++#define FILE_ATTR_SIZE_LATEST FILE_ATTR_SIZE_VER1
+ 
+ /*
+  * Flags for the fsx_xflags field
+-- 
+2.51.0.windows.1
+

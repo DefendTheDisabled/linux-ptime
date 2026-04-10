@@ -1,0 +1,137 @@
+From ca440452accbfe8b60c758faeb02fda331519024 Mon Sep 17 00:00:00 2001
+From: Sean Smith <DefendTheDisabled@gmail.com>
+Date: Thu, 9 Apr 2026 15:57:15 -0500
+Subject: [PATCH 01/16] vfs: add ptime fields to iattr, kstat, and statx
+
+Adds the in-kernel and userspace-visible infrastructure for a new
+settable timestamp: provenance_time (ptime). Distinct from birth
+time (btime): ptime is the user-settable "original creation date"
+that survives cross-filesystem copies, while btime remains the
+forensic "when did this inode come into existence on this FS"
+immutable.
+
+VFS hooks:
+- ATTR_PTIME (bit 19) marks a ptime update in iattr.ia_valid
+- ATTR_PTIME_SET (bit 20) marks that ia_ptime carries an explicit
+  value (mirrors the ATTR_MTIME/ATTR_MTIME_SET convention). If
+  ATTR_PTIME is set without ATTR_PTIME_SET, notify_change() sets
+  ia_ptime to current time; if both are set, ia_ptime is truncated
+  to the inode's timestamp granularity via timestamp_truncate().
+- ia_ptime in struct iattr carries the value through notify_change
+- STATX_PTIME (0x00040000) requests ptime from getattr
+- stx_ptime in struct statx returns it to userspace
+- kstat.ptime is the in-kernel getattr result buffer
+
+notify_change() applies ATTR_PTIME to the inode before dispatching
+to filesystem-specific setattr callbacks. The generic stat path in
+fs/stat.c copies kstat.ptime into the statx result when requested.
+
+Filesystem-specific ptime storage and getattr/setattr logic come
+in subsequent commits.
+
+Ref: Decision #38 (pivot to kernel ptime from xattr approach)
+Ref: Decision #44 (5-filesystem scope: btrfs, ntfs3, ext4, FAT, exFAT)
+Files: fs/attr.c:notify_change, fs/stat.c:do_statx
+---
+ fs/attr.c                 | 6 +++++-
+ fs/stat.c                 | 2 ++
+ include/linux/fs.h        | 3 +++
+ include/linux/stat.h      | 1 +
+ include/uapi/linux/stat.h | 4 +++-
+ 5 files changed, 14 insertions(+), 2 deletions(-)
+
+diff --git a/fs/attr.c b/fs/attr.c
+index b9ec6b47bab2..7fa9c01d145b 100644
+--- a/fs/attr.c
++++ b/fs/attr.c
+@@ -206,7 +206,7 @@ int setattr_prepare(struct mnt_idmap *idmap, struct dentry *dentry,
+ 	}
+ 
+ 	/* Check for setting the inode time. */
+-	if (ia_valid & (ATTR_MTIME_SET | ATTR_ATIME_SET | ATTR_TIMES_SET)) {
++	if (ia_valid & (ATTR_MTIME_SET | ATTR_ATIME_SET | ATTR_PTIME_SET | ATTR_TIMES_SET)) {
+ 		if (!inode_owner_or_capable(idmap, inode))
+ 			return -EPERM;
+ 	}
+@@ -466,6 +466,10 @@ int notify_change(struct mnt_idmap *idmap, struct dentry *dentry,
+ 		attr->ia_mtime = timestamp_truncate(attr->ia_mtime, inode);
+ 	else
+ 		attr->ia_mtime = now;
++	if (ia_valid & ATTR_PTIME_SET)
++		attr->ia_ptime = timestamp_truncate(attr->ia_ptime, inode);
++	else if (ia_valid & ATTR_PTIME)
++		attr->ia_ptime = now;
+ 
+ 	if (ia_valid & ATTR_KILL_PRIV) {
+ 		error = security_inode_need_killpriv(dentry);
+diff --git a/fs/stat.c b/fs/stat.c
+index 6c79661e1b96..9284bb753cc7 100644
+--- a/fs/stat.c
++++ b/fs/stat.c
+@@ -728,6 +728,8 @@ cp_statx(const struct kstat *stat, struct statx __user *buffer)
+ 	tmp.stx_atime.tv_nsec = stat->atime.tv_nsec;
+ 	tmp.stx_btime.tv_sec = stat->btime.tv_sec;
+ 	tmp.stx_btime.tv_nsec = stat->btime.tv_nsec;
++	tmp.stx_ptime.tv_sec = stat->ptime.tv_sec;
++	tmp.stx_ptime.tv_nsec = stat->ptime.tv_nsec;
+ 	tmp.stx_ctime.tv_sec = stat->ctime.tv_sec;
+ 	tmp.stx_ctime.tv_nsec = stat->ctime.tv_nsec;
+ 	tmp.stx_mtime.tv_sec = stat->mtime.tv_sec;
+diff --git a/include/linux/fs.h b/include/linux/fs.h
+index a01621fa636a..e01f9a2a1d39 100644
+--- a/include/linux/fs.h
++++ b/include/linux/fs.h
+@@ -239,6 +239,8 @@ typedef int (dio_iodone_t)(struct kiocb *iocb, loff_t offset,
+ #define ATTR_TIMES_SET	(1 << 16)
+ #define ATTR_TOUCH	(1 << 17)
+ #define ATTR_DELEG	(1 << 18) /* Delegated attrs. Don't break write delegations */
++#define ATTR_PTIME	(1 << 19) /* Set provenance time */
++#define ATTR_PTIME_SET	(1 << 20) /* Set provenance time to specific value */
+ 
+ /*
+  * Whiteout is represented by a char device.  The following constants define the
+@@ -283,6 +285,7 @@ struct iattr {
+ 	struct timespec64 ia_atime;
+ 	struct timespec64 ia_mtime;
+ 	struct timespec64 ia_ctime;
++	struct timespec64 ia_ptime;
+ 
+ 	/*
+ 	 * Not an attribute, but an auxiliary info for filesystems wanting to
+diff --git a/include/linux/stat.h b/include/linux/stat.h
+index e3d00e7bb26d..52272000c6ec 100644
+--- a/include/linux/stat.h
++++ b/include/linux/stat.h
+@@ -48,6 +48,7 @@ struct kstat {
+ 	struct timespec64 mtime;
+ 	struct timespec64 ctime;
+ 	struct timespec64 btime;			/* File creation time */
++	struct timespec64 ptime;			/* Provenance time */
+ 	u64		blocks;
+ 	u64		mnt_id;
+ 	u64		change_cookie;
+diff --git a/include/uapi/linux/stat.h b/include/uapi/linux/stat.h
+index 1686861aae20..0c8db37153fe 100644
+--- a/include/uapi/linux/stat.h
++++ b/include/uapi/linux/stat.h
+@@ -187,7 +187,8 @@ struct statx {
+ 	__u32	__spare2[1];
+ 
+ 	/* 0xc0 */
+-	__u64	__spare3[8];	/* Spare space for future expansion */
++	struct statx_timestamp	stx_ptime;	/* File provenance time */
++	__u64	__spare3[6];		/* Spare space for future expansion */
+ 
+ 	/* 0x100 */
+ };
+@@ -219,6 +220,7 @@ struct statx {
+ #define STATX_SUBVOL		0x00008000U	/* Want/got stx_subvol */
+ #define STATX_WRITE_ATOMIC	0x00010000U	/* Want/got atomic_write_* fields */
+ #define STATX_DIO_READ_ALIGN	0x00020000U	/* Want/got dio read alignment info */
++#define STATX_PTIME		0x00040000U	/* Want/got stx_ptime */
+ 
+ #define STATX__RESERVED		0x80000000U	/* Reserved for future struct statx expansion */
+ 
+-- 
+2.51.0.windows.1
+

@@ -1,0 +1,263 @@
+diff --git a/cmds/receive-dump.c b/cmds/receive-dump.c
+index 89a4d567..1b19ee29 100644
+--- a/cmds/receive-dump.c
++++ b/cmds/receive-dump.c
+@@ -281,18 +281,46 @@ static int sprintf_timespec(struct timespec *ts, char *dest, int max_size)
+ #define TIME_STRING_MAX	64
+ static int print_utimes(const char *path, struct timespec *at,
+ 			struct timespec *mt, struct timespec *ct,
+-			void *user)
++			struct timespec *pt, void *user)
+ {
+ 	char at_str[TIME_STRING_MAX];
+ 	char mt_str[TIME_STRING_MAX];
+ 	char ct_str[TIME_STRING_MAX];
++	char pt_str[TIME_STRING_MAX];
+ 
+ 	if (sprintf_timespec(at, at_str, TIME_STRING_MAX - 1) < 0 ||
+ 	    sprintf_timespec(mt, mt_str, TIME_STRING_MAX - 1) < 0 ||
+ 	    sprintf_timespec(ct, ct_str, TIME_STRING_MAX - 1) < 0)
+ 		return -EINVAL;
+-	return PRINT_DUMP(user, path, "utimes", "atime=%s mtime=%s ctime=%s",
+-			  at_str, mt_str, ct_str);
++
++	/*
++	 * Three render cases for ptime:
++	 *   pt == NULL              : no ptime field (unpatched
++	 *                             sender — stream did not
++	 *                             carry BTRFS_SEND_A_PTIME)
++	 *   pt != NULL, value zero  : "ptime=unset" (explicit
++	 *                             clear from patched sender —
++	 *                             distinct from absent for
++	 *                             log forensics)
++	 *   pt != NULL, value !=0   : ptime=<formatted timespec>
++	 */
++	if (!pt) {
++		return PRINT_DUMP(user, path, "utimes",
++				  "atime=%s mtime=%s ctime=%s",
++				  at_str, mt_str, ct_str);
++	}
++
++	if (pt->tv_sec == 0 && pt->tv_nsec == 0) {
++		return PRINT_DUMP(user, path, "utimes",
++				  "atime=%s mtime=%s ctime=%s ptime=unset",
++				  at_str, mt_str, ct_str);
++	}
++
++	if (sprintf_timespec(pt, pt_str, TIME_STRING_MAX - 1) < 0)
++		return -EINVAL;
++	return PRINT_DUMP(user, path, "utimes",
++			  "atime=%s mtime=%s ctime=%s ptime=%s",
++			  at_str, mt_str, ct_str, pt_str);
+ }
+ 
+ static int print_update_extent(const char *path, u64 offset, u64 len,
+diff --git a/cmds/receive.c b/cmds/receive.c
+index 1a4a043b..0e052881 100644
+--- a/cmds/receive.c
++++ b/cmds/receive.c
+@@ -20,6 +20,7 @@
+ #include <sys/stat.h>
+ #include <sys/ioctl.h>
+ #include <sys/xattr.h>
++#include <sys/syscall.h>
+ #include <linux/fs.h>
+ #if HAVE_LINUX_FSVERITY_H
+ #include <linux/fsverity.h>
+@@ -37,6 +38,19 @@
+ #include <string.h>
+ #include <uuid/uuid.h>
+ #include <zlib.h>
++
++/*
++ * Provenance time (ptime) is written via file_setattr(2),
++ * syscall 469 on x86_64 (kernel 6.17+). Prefer the libc/kernel
++ * symbol when available; fall back to the x86_64 number.
++ */
++#ifndef SYS_file_setattr
++#  ifdef __NR_file_setattr
++#    define SYS_file_setattr __NR_file_setattr
++#  else
++#    define SYS_file_setattr 469
++#  endif
++#endif
+ #if COMPRESSION_LZO
+ #include <lzo/lzoconf.h>
+ #include <lzo/lzo1x.h>
+@@ -969,7 +983,7 @@ out:
+ 
+ static int process_utimes(const char *path, struct timespec *at,
+ 			  struct timespec *mt, struct timespec *ct,
+-			  void *user)
++			  struct timespec *pt, void *user)
+ {
+ 	int ret = 0;
+ 	struct btrfs_receive *rctx = user;
+@@ -994,6 +1008,88 @@ static int process_utimes(const char *path, struct timespec *at,
+ 		goto out;
+ 	}
+ 
++	/*
++	 * Apply provenance time (ptime) via file_setattr(2) when the
++	 * sender provided a non-NULL pt pointer. NULL means the
++	 * stream did not carry BTRFS_SEND_A_PTIME (unpatched sender
++	 * or proto < 2) — in that case the destination file's
++	 * existing ptime is left untouched. A non-NULL pt with value
++	 * {0, 0} represents an explicit ptime clear from the sender
++	 * and is applied as ptime=0 on the destination.
++	 *
++	 * Skipping symlinks: file_setattr's notify_change ATTR_PTIME
++	 * path fails structurally on symlink inodes; the existing
++	 * cp/rsync/tar/borg patches all use flags=0 here. We lstat
++	 * to detect symlinks and skip them with a warning. ENOSYS
++	 * (kernel lacks file_setattr — LTS fallback boot) and
++	 * EOPNOTSUPP (filesystem doesn't support ptime setattr) are
++	 * soft failures: log and continue, since the snapshot is
++	 * structurally correct without ptime.
++	 */
++	if (pt) {
++		struct stat stbuf;
++		unsigned char fa[40];
++		long fs_ret;
++
++		if (lstat(full_path, &stbuf) < 0) {
++			ret = -errno;
++			error("utimes(ptime) lstat %s failed: %m", path);
++			goto out;
++		}
++
++		if (S_ISLNK(stbuf.st_mode)) {
++			if (bconf.verbose >= 2)
++				fprintf(stderr,
++					"ptime skipped on symlink %s\n",
++					path);
++			ret = 0;
++			goto out;
++		}
++
++		memset(fa, 0, sizeof(fa));
++		/*
++		 * struct file_attr VER1 layout (40 bytes):
++		 *   offset  0..23: VER0 fields (xflags, extsize,
++		 *                  nextents, projid, cowextsize) —
++		 *                  ALL ZERO so file_setattr stays
++		 *                  on the notify_change/iattr path
++		 *                  and does NOT dispatch to
++		 *                  vfs_fileattr_set (which on Btrfs
++		 *                  could clobber compression/nocow/
++		 *                  immutable/append xflags).
++		 *   offset 24..31: fa_ptime_sec  (__s64)
++		 *   offset 32..35: fa_ptime_nsec (__u32)
++		 *   offset 36..39: fa_ptime_pad  (__u32, must be 0)
++		 */
++		{
++			int64_t sec64 = (int64_t)pt->tv_sec;
++			uint32_t nsec32 = (uint32_t)pt->tv_nsec;
++
++			memcpy(fa + 24, &sec64, 8);
++			memcpy(fa + 32, &nsec32, 4);
++		}
++
++		fs_ret = syscall(SYS_file_setattr, AT_FDCWD, full_path,
++				 fa, (size_t)40, 0);
++		if (fs_ret < 0) {
++			int saved_errno = errno;
++
++			if (saved_errno == ENOSYS ||
++			    saved_errno == EOPNOTSUPP) {
++				if (bconf.verbose >= 1)
++					fprintf(stderr,
++						"ptime setattr unsupported by kernel or filesystem on %s, continuing without ptime preservation\n",
++						path);
++				ret = 0;
++				goto out;
++			}
++			ret = -saved_errno;
++			error("utimes(ptime) %s failed: %s", path,
++			      strerror(saved_errno));
++			goto out;
++		}
++	}
++
+ out:
+ 	return ret;
+ }
+diff --git a/common/send-stream.c b/common/send-stream.c
+index dacf0562..922e984e 100644
+--- a/common/send-stream.c
++++ b/common/send-stream.c
+@@ -368,6 +368,8 @@ static int read_and_process_cmd(struct btrfs_send_stream *sctx)
+ 	struct timespec at;
+ 	struct timespec ct;
+ 	struct timespec mt;
++	struct timespec pt;
++	struct timespec *ptp;
+ 	u8 uuid[BTRFS_UUID_SIZE];
+ 	u8 clone_uuid[BTRFS_UUID_SIZE];
+ 	u32 compression;
+@@ -541,7 +543,22 @@ static int read_and_process_cmd(struct btrfs_send_stream *sctx)
+ 		TLV_GET_TIMESPEC(sctx, BTRFS_SEND_A_ATIME, &at);
+ 		TLV_GET_TIMESPEC(sctx, BTRFS_SEND_A_MTIME, &mt);
+ 		TLV_GET_TIMESPEC(sctx, BTRFS_SEND_A_CTIME, &ct);
+-		ret = sctx->ops->utimes(path, &at, &mt, &ct, sctx->user);
++		/*
++		 * BTRFS_SEND_A_PTIME is optional. A patched sender on
++		 * proto >= 2 always emits it (even when zero, to
++		 * distinguish "explicit clear" from "absent"). An
++		 * unpatched sender or proto < 2 stream omits the
++		 * attribute entirely. cmd_attrs[].data is the
++		 * presence indicator (cleared per command via memset
++		 * at the top of read_and_process_cmd).
++		 */
++		if (sctx->cmd_attrs[BTRFS_SEND_A_PTIME].data) {
++			TLV_GET_TIMESPEC(sctx, BTRFS_SEND_A_PTIME, &pt);
++			ptp = &pt;
++		} else {
++			ptp = NULL;
++		}
++		ret = sctx->ops->utimes(path, &at, &mt, &ct, ptp, sctx->user);
+ 		break;
+ 	case BTRFS_SEND_C_UPDATE_EXTENT:
+ 		TLV_GET_STRING(sctx, BTRFS_SEND_A_PATH, &path);
+diff --git a/common/send-stream.h b/common/send-stream.h
+index 5000fb45..b6da28a1 100644
+--- a/common/send-stream.h
++++ b/common/send-stream.h
+@@ -51,9 +51,15 @@ struct btrfs_send_ops {
+ 	int (*truncate)(const char *path, u64 size, void *user);
+ 	int (*chmod)(const char *path, u64 mode, void *user);
+ 	int (*chown)(const char *path, u64 uid, u64 gid, void *user);
++	/*
++	 * pt may be NULL when the stream did not carry
++	 * BTRFS_SEND_A_PTIME (unpatched sender or proto < 2). A
++	 * non-NULL pt with value {0, 0} represents an explicit
++	 * ptime clear from the sender — distinct from absence.
++	 */
+ 	int (*utimes)(const char *path, struct timespec *at,
+ 		      struct timespec *mt, struct timespec *ct,
+-		      void *user);
++		      struct timespec *pt, void *user);
+ 	int (*update_extent)(const char *path, u64 offset, u64 len, void *user);
+ 	int (*encoded_write)(const char *path, const void *data, u64 offset,
+ 			     u64 len, u64 unencoded_file_len, u64 unencoded_len,
+diff --git a/kernel-shared/send.h b/kernel-shared/send.h
+index a5f5b47b..06b61c67 100644
+--- a/kernel-shared/send.h
++++ b/kernel-shared/send.h
+@@ -195,7 +195,15 @@ enum {
+ 	BTRFS_SEND_A_VERITY_SIG_DATA	= 35,
+ 	BTRFS_SEND_A_MAX_V3		= 35,
+ 
+-	__BTRFS_SEND_A_MAX		= 35,
++	/*
++	 * Provenance time extension. Added after v3; gated at
++	 * emission by sctx->proto >= 2 (matches OTIME pattern).
++	 * Not part of the v1/v2/v3 version buckets. Mirrors the
++	 * kernel side at fs/btrfs/send.h.
++	 */
++	BTRFS_SEND_A_PTIME		= 36,
++
++	__BTRFS_SEND_A_MAX		= 36,
+ };
+ 
+ long btrfs_ioctl_send(struct inode *inode, struct btrfs_ioctl_send_args *arg);

@@ -1,0 +1,68 @@
+From 0972e474a057bbfe03a1995916dd976f319e01aa Mon Sep 17 00:00:00 2001
+From: Sean Smith <DefendTheDisabled@gmail.com>
+Date: Thu, 9 Apr 2026 16:00:34 -0500
+Subject: [PATCH 10/16] ntfs3: preserve ptime across rename-over
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Implements rename-over preservation for ntfs3, mirroring the
+Btrfs approach but using i_crtime directly (since ntfs3 maps
+ptime to NTFS Date Created).
+
+When atomic save creates a new file and renames it over an
+existing file, normally the new file has a fresh crtime (the
+time of the temp file creation). This silently destroys the
+original file's creation date — the exact scenario ptime is
+designed to prevent.
+
+Fix: in ntfs_rename, when the target exists, save the target's
+i_crtime before replacing it, then apply the saved value to the
+new inode's i_crtime. Matches Windows behavior where File
+Explorer and PowerShell Move-Item preserve the target's
+creation time.
+
+Guards: only regular files with nlink=1, excludes
+RENAME_EXCHANGE and RENAME_WHITEOUT.
+
+Ref: Decision #51 (rename-over preservation on all 5 filesystems)
+Files: fs/ntfs3/namei.c:ntfs_rename
+---
+ fs/ntfs3/namei.c | 14 ++++++++++++++
+ 1 file changed, 14 insertions(+)
+
+diff --git a/fs/ntfs3/namei.c b/fs/ntfs3/namei.c
+index b2af8f695e60..40d06884fac7 100644
+--- a/fs/ntfs3/namei.c
++++ b/fs/ntfs3/namei.c
+@@ -292,6 +292,16 @@ static int ntfs_rename(struct mnt_idmap *idmap, struct inode *dir,
+ 		return -EINVAL;
+ 	}
+ 
++	/* ptime rename-over: save target creation time before unlink */
++	struct timespec64 saved_crtime = {};
++	bool inherit_crtime = false;
++
++	if (new_inode && S_ISREG(inode->i_mode) &&
++	    S_ISREG(new_inode->i_mode) && inode->i_nlink == 1) {
++		saved_crtime = ntfs_i(new_inode)->i_crtime;
++		inherit_crtime = true;
++	}
++
+ 	if (new_inode) {
+ 		/* Target name exists. Unlink it. */
+ 		dget(new_dentry);
+@@ -330,6 +340,10 @@ static int ntfs_rename(struct mnt_idmap *idmap, struct inode *dir,
+ 
+ 	err = ni_rename(dir_ni, new_dir_ni, ni, de, new_de);
+ 	if (!err) {
++		/* ptime rename-over: inherit target creation time */
++		if (inherit_crtime)
++			ni->i_crtime = saved_crtime;
++
+ 		simple_rename_timestamp(dir, dentry, new_dir, new_dentry);
+ 		mark_inode_dirty(inode);
+ 		mark_inode_dirty(dir);
+-- 
+2.51.0.windows.1
+

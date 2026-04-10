@@ -1,0 +1,104 @@
+From 694ac409693fbe39915c67ac2ad2ee0fca2c9a66 Mon Sep 17 00:00:00 2001
+From: Sean Smith <DefendTheDisabled@gmail.com>
+Date: Thu, 9 Apr 2026 16:01:16 -0500
+Subject: [PATCH 13/16] fat: map ptime to creation time with rename
+ preservation
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Maps ptime to FAT creation time (crtime) for vfat
+getattr/setattr, with rename-over preservation.
+
+FAT has a creation timestamp in the directory entry at 10ms
+precision (centisecond field). Like NTFS, this time is natively
+mutable — ptime writes simply overwrite the on-disk creation
+time.
+
+Implementation:
+- fat_getattr: copy crtime to kstat.ptime when STATX_PTIME
+  requested AND the mount is vfat (sbi->options.isvfat check).
+  Plain msdos mode does not report ptime — msdos doesn't use
+  long filenames and historically stores a simpler time format.
+- fat_setattr: handle ATTR_PTIME by writing to inode->i_crtime
+  and marking the inode dirty. The on-disk write path picks it
+  up on next writeback.
+- vfat_rename: preserve target's crtime onto source inode when
+  atomic save pattern is detected
+
+Precision caveat: FAT stores centiseconds (10ms), so sub-10ms
+nanosecond values are rounded on persistence. Read-back returns
+the rounded value. Documented in the spec and README as an edge
+limitation.
+
+Rename-over is combined in this commit (small, tightly coupled
+with getattr/setattr) rather than split as for ntfs3/ext4.
+
+Ref: Decision #51 (rename-over preservation on all 5 filesystems)
+Ref: Decision #49 (mapped ptime architecture)
+Files: fs/fat/file.c:fat_getattr
+Files: fs/fat/file.c:fat_setattr
+Files: fs/fat/namei_vfat.c:vfat_rename
+---
+ fs/fat/file.c       |  6 ++++++
+ fs/fat/namei_vfat.c | 20 ++++++++++++++++++--
+ 2 files changed, 24 insertions(+), 2 deletions(-)
+
+diff --git a/fs/fat/file.c b/fs/fat/file.c
+index 4fc49a614fb8..9d1fcc554fce 100644
+--- a/fs/fat/file.c
++++ b/fs/fat/file.c
+@@ -413,6 +413,10 @@ int fat_getattr(struct mnt_idmap *idmap, const struct path *path,
+ 		stat->result_mask |= STATX_BTIME;
+ 		stat->btime = MSDOS_I(inode)->i_crtime;
+ 	}
++	if (sbi->options.isvfat && (request_mask & STATX_PTIME)) {
++		stat->result_mask |= STATX_PTIME;
++		stat->ptime = MSDOS_I(inode)->i_crtime;
++	}
+ 
+ 	return 0;
+ }
+@@ -564,6 +568,8 @@ int fat_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
+ 		fat_truncate_time(inode, &attr->ia_mtime, S_MTIME);
+ 	attr->ia_valid &= ~(ATTR_ATIME|ATTR_CTIME|ATTR_MTIME);
+ 
++	if (attr->ia_valid & ATTR_PTIME)
++		MSDOS_I(inode)->i_crtime = attr->ia_ptime;
+ 	setattr_copy(idmap, inode, attr);
+ 	mark_inode_dirty(inode);
+ out:
+diff --git a/fs/fat/namei_vfat.c b/fs/fat/namei_vfat.c
+index 47ff083cfc7e..f1e2eadf800e 100644
+--- a/fs/fat/namei_vfat.c
++++ b/fs/fat/namei_vfat.c
+@@ -975,8 +975,24 @@ static int vfat_rename(struct inode *old_dir, struct dentry *old_dentry,
+ 	}
+ 	inode_inc_iversion(new_dir);
+ 
+-	fat_detach(old_inode);
+-	fat_attach(old_inode, new_i_pos);
++	/* ptime rename-over: save target creation time */
++	{
++		struct timespec64 saved_crtime = {};
++		bool inherit_crtime = false;
++
++		if (new_inode && S_ISREG(old_inode->i_mode) &&
++		    S_ISREG(new_inode->i_mode) && old_inode->i_nlink == 1) {
++			saved_crtime = MSDOS_I(new_inode)->i_crtime;
++			inherit_crtime = true;
++		}
++
++		fat_detach(old_inode);
++		fat_attach(old_inode, new_i_pos);
++
++		if (inherit_crtime)
++			MSDOS_I(old_inode)->i_crtime = saved_crtime;
++	}
++
+ 	err = vfat_sync_ipos(new_dir, old_inode);
+ 	if (err)
+ 		goto error_inode;
+-- 
+2.51.0.windows.1
+

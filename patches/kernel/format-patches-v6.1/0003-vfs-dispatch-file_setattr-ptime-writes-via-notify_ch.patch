@@ -1,0 +1,149 @@
+From abc79573fd07f34c2af1a0210371328e3f01bb4d Mon Sep 17 00:00:00 2001
+From: Sean Smith <DefendTheDisabled@gmail.com>
+Date: Thu, 9 Apr 2026 15:57:51 -0500
+Subject: [PATCH 03/16] vfs: dispatch file_setattr ptime writes via
+ notify_change
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Routes ptime writes from the file_setattr(469) syscall through
+notify_change() (the iattr/setattr path), while xflags continue
+through vfs_fileattr_set() (the .fileattr_set path). This
+dual-dispatch is necessary because ntfs3, FAT, and exFAT do not
+implement .fileattr_set — they would otherwise reject all
+file_setattr calls with ENOTTY.
+
+The dispatch logic is sequential, not parallel:
+  1. If ptime_valid is set (VER1+), build iattr with ATTR_PTIME
+     | ATTR_PTIME_SET and ia_ptime from the user struct, call
+     notify_change(). On failure, return the error immediately
+     without applying xflags.
+  2. If notify_change() succeeded and any other fa_valid bits
+     remain (xflags, etc.), call vfs_fileattr_set() as before.
+  3. If vfs_fileattr_set() fails after a successful ptime update,
+     the ptime update is NOT rolled back. Userspace sees the
+     xflags error, but the ptime change persists. This is
+     consistent with how setattr operations chain in general:
+     each attribute modification is committed independently.
+
+This preserves backward compatibility: VER0 file_attr calls
+(xflags only, no ptime) behave exactly as before the patch.
+New VER1 calls with only ptime work on all five supported
+filesystems.
+
+file_setattr validates that ptime_pad is zero on input and
+nsec < 1_000_000_000. Invalid values return -EINVAL.
+
+Ref: Decision #72 (dual-dispatch architecture)
+Ref: Decision #71 (file_setattr syscall 469)
+Files: fs/file_attr.c:file_setattr (syscall entry)
+---
+ fs/file_attr.c           | 60 +++++++++++++++++++++++++++++++++++++---
+ include/linux/fileattr.h |  5 ++++
+ 2 files changed, 61 insertions(+), 4 deletions(-)
+
+diff --git a/fs/file_attr.c b/fs/file_attr.c
+index 4889cf59b256..443ddad666f3 100644
+--- a/fs/file_attr.c
++++ b/fs/file_attr.c
+@@ -148,6 +148,10 @@ static int file_attr_to_fileattr(const struct file_attr *fattr,
+ 	fa->fsx_projid = fattr->fa_projid;
+ 	fa->fsx_cowextsize = fattr->fa_cowextsize;
+ 
++	/* Always copy ptime fields; caller sets ptime_valid based on usize */
++	fa->ptime.tv_sec = fattr->fa_ptime_sec;
++	fa->ptime.tv_nsec = fattr->fa_ptime_nsec;
++
+ 	return 0;
+ }
+ 
+@@ -481,10 +485,58 @@ SYSCALL_DEFINE5(file_setattr, int, dfd, const char __user *, filename,
+ 
+ 	error = mnt_want_write(filepath.mnt);
+ 	if (!error) {
+-		error = vfs_fileattr_set(mnt_idmap(filepath.mnt),
+-					 filepath.dentry, &fa);
+-		if (error == -ENOIOCTLCMD || error == -ENOTTY)
+-			error = -EOPNOTSUPP;
++		/* ptime fields present only if userspace struct is VER1+ */
++		if (usize >= FILE_ATTR_SIZE_VER1) {
++			if (fattr.fa_ptime_pad != 0) {
++				error = -EINVAL;
++				goto drop_write;
++			}
++			if (fattr.fa_ptime_nsec >= 1000000000U) {
++				error = -EINVAL;
++				goto drop_write;
++			}
++			fa.ptime_valid = true;
++		}
++
++		/* Handle ptime via notify_change (iattr/setattr path).
++		 * Lock/unlock inode separately from vfs_fileattr_set below;
++		 * sequential acquisition, never nested — no deadlock risk.
++		 * ptime and xflags are orthogonal; brief TOCTOU gap between
++		 * the two operations is acceptable (same as chmod+chown). */
++		if (fa.ptime_valid) {
++			struct iattr attr = {};
++			struct inode *inode = d_inode(filepath.dentry);
++
++			attr.ia_valid = ATTR_PTIME | ATTR_PTIME_SET;
++			attr.ia_ptime = fa.ptime;
++			inode_lock(inode);
++			error = notify_change(mnt_idmap(filepath.mnt),
++					      filepath.dentry, &attr, NULL);
++			inode_unlock(inode);
++			if (error)
++				goto drop_write;
++		}
++
++		/* Handle file attrs (xflags, extsize, projid, cowextsize).
++		 * Clear ptime from file_kattr — already handled via
++		 * notify_change above; .fileattr_set must not process it. */
++		{
++			bool had_ptime = fa.ptime_valid;
++			fa.ptime_valid = false;
++			fa.ptime = (struct timespec64){};
++
++			if (fattr.fa_xflags || fattr.fa_extsize ||
++			    fattr.fa_projid || fattr.fa_cowextsize) {
++				error = vfs_fileattr_set(mnt_idmap(filepath.mnt),
++							 filepath.dentry, &fa);
++				if (error == -ENOIOCTLCMD || error == -ENOTTY)
++					error = -EOPNOTSUPP;
++			} else if (!had_ptime) {
++				/* No ptime and no file attrs -- nothing to set */
++				error = -EINVAL;
++			}
++		}
++drop_write:
+ 		mnt_drop_write(filepath.mnt);
+ 	}
+ 
+diff --git a/include/linux/fileattr.h b/include/linux/fileattr.h
+index f89dcfad3f8f..7db01e6049e5 100644
+--- a/include/linux/fileattr.h
++++ b/include/linux/fileattr.h
+@@ -3,6 +3,8 @@
+ #ifndef _LINUX_FILEATTR_H
+ #define _LINUX_FILEATTR_H
+ 
++#include <linux/time64.h>
++
+ /* Flags shared betwen flags/xflags */
+ #define FS_COMMON_FL \
+ 	(FS_SYNC_FL | FS_IMMUTABLE_FL | FS_APPEND_FL | \
+@@ -51,6 +53,9 @@ struct file_kattr {
+ 	/* selectors: */
+ 	bool	flags_valid:1;
+ 	bool	fsx_valid:1;
++	bool	ptime_valid:1;
++	/* provenance time */
++	struct timespec64 ptime;
+ };
+ 
+ int copy_fsxattr_to_user(const struct file_kattr *fa, struct fsxattr __user *ufa);
+-- 
+2.51.0.windows.1
+

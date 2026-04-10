@@ -1,0 +1,98 @@
+From 38155acdc4445e937f96f38fa236dfc9a9d22b31 Mon Sep 17 00:00:00 2001
+From: Sean Smith <DefendTheDisabled@gmail.com>
+Date: Thu, 9 Apr 2026 16:00:06 -0500
+Subject: [PATCH 08/16] btrfs: preserve ptime across rename-over and tree-log
+ replay
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Implements two atomicity guarantees for ptime:
+
+1. Rename-over preservation (fs/btrfs/inode.c:btrfs_rename):
+   When an unpatched application saves a file via the atomic
+   save pattern (write-to-temp + rename(temp, original)), the
+   rename creates a NEW inode replacing the original. Without
+   this logic, the new inode has no ptime — the original file's
+   creation date is silently lost.
+
+   The preservation logic: if the source inode has ptime=0 and
+   the target inode has ptime set, inherit the target's ptime
+   onto the source before the rename completes. This is the
+   "ptime follows the path" semantic — file at path /foo keeps
+   its ptime even when the inode behind /foo changes.
+
+   Only applies to regular files with nlink=1 (single-link files)
+   and excludes RENAME_EXCHANGE / RENAME_WHITEOUT. If the rename
+   fails after ptime mutation, the in-memory value is harmless
+   (overwritten on next read from disk).
+
+2. Tree-log replay (fs/btrfs/tree-log.c:fill_inode_item):
+   Btrfs tree-log is used for fast crash recovery of recently-
+   written inodes. When the log replays an inode_item, it must
+   include ptime in the recovered state, or crash-recovered
+   inodes lose their ptime even if the on-disk inode had it.
+
+Together these ensure ptime survives: (a) the most common write
+pattern used by Vim, LibreOffice, Kate, Emacs (rename-over), and
+(b) system crashes with uncommitted writes.
+
+Ref: Decision #38 (rename-over preservation was the key insight
+     that motivated kernel ptime over xattr)
+Ref: Decision #51 (rename-over preservation on all 5 filesystems)
+Files: fs/btrfs/inode.c:btrfs_rename (rename-over block)
+Files: fs/btrfs/tree-log.c:fill_inode_item
+---
+ fs/btrfs/inode.c    | 22 ++++++++++++++++++++++
+ fs/btrfs/tree-log.c |  2 ++
+ 2 files changed, 24 insertions(+)
+
+diff --git a/fs/btrfs/inode.c b/fs/btrfs/inode.c
+index 55d4e6e367ef..a111f4896fa2 100644
+--- a/fs/btrfs/inode.c
++++ b/fs/btrfs/inode.c
+@@ -8697,6 +8697,28 @@ static int btrfs_rename(struct mnt_idmap *idmap,
+ 			btrfs_abort_transaction(trans, ret);
+ 			goto out_fail;
+ 		}
++		/*
++		 * ptime rename-over preservation: if a file with no ptime
++		 * is being renamed over a file that has ptime (the atomic
++		 * save pattern: write-to-temp + rename over original),
++		 * inherit the target's ptime so provenance survives.
++		 */
++		if (new_inode && S_ISREG(old_inode->i_mode) &&
++		    S_ISREG(new_inode->i_mode) && old_inode->i_nlink == 1 &&
++		    !(flags & (RENAME_EXCHANGE | RENAME_WHITEOUT))) {
++			struct btrfs_inode *old_bi = BTRFS_I(old_inode);
++			struct btrfs_inode *new_bi = BTRFS_I(new_inode);
++			if (!old_bi->i_ptime_sec && !old_bi->i_ptime_nsec &&
++			    (new_bi->i_ptime_sec || new_bi->i_ptime_nsec)) {
++				old_bi->i_ptime_sec = new_bi->i_ptime_sec;
++				old_bi->i_ptime_nsec = new_bi->i_ptime_nsec;
++			}
++		}
++		/* Note: if rename fails below, ptime mutation is harmless —
++		 * the source file keeps its previous ptime=0 semantics since
++		 * the rename didn't complete. The in-memory value will be
++		 * overwritten on next inode read from disk. */
++
+ 		ret = btrfs_update_inode(trans, BTRFS_I(old_inode));
+ 		if (unlikely(ret)) {
+ 			btrfs_abort_transaction(trans, ret);
+diff --git a/fs/btrfs/tree-log.c b/fs/btrfs/tree-log.c
+index 6c40f48cc194..7ed09af22b2c 100644
+--- a/fs/btrfs/tree-log.c
++++ b/fs/btrfs/tree-log.c
+@@ -4640,6 +4640,8 @@ static void fill_inode_item(struct btrfs_trans_handle *trans,
+ 
+ 	btrfs_set_timespec_sec(leaf, &item->otime, BTRFS_I(inode)->i_otime_sec);
+ 	btrfs_set_timespec_nsec(leaf, &item->otime, BTRFS_I(inode)->i_otime_nsec);
++	btrfs_set_timespec_sec(leaf, &item->ptime, BTRFS_I(inode)->i_ptime_sec);
++	btrfs_set_timespec_nsec(leaf, &item->ptime, BTRFS_I(inode)->i_ptime_nsec);
+ 
+ 	/*
+ 	 * We do not need to set the nbytes field, in fact during a fast fsync
+-- 
+2.51.0.windows.1
+

@@ -1,0 +1,73 @@
+--- /tmp/ptime-diff/dolphin-25.12.3/src/kitemviews/kfileitemlistwidget.cpp	2026-03-01 20:46:12.000000000 -0600
++++ dolphin-25.12.3/src/kitemviews/kfileitemlistwidget.cpp	2026-04-04 22:18:19.096968756 -0500
+@@ -84,7 +84,7 @@
+             const KIO::filesize_t size = roleValue.value<KIO::filesize_t>();
+             text = formatter.formatByteSize(size);
+         }
+-    } else if (role == "modificationtime" || role == "creationtime" || role == "accesstime") {
++    } else if (role == "modificationtime" || role == "creationtime" || role == "accesstime" || role == "provenancetime") {
+         bool ok;
+         const long long time = roleValue.toLongLong(&ok);
+         if (ok && time != -1) {
+--- /tmp/ptime-diff/dolphin-25.12.3/src/kitemviews/kfileitemmodel.cpp	2026-03-01 20:46:12.000000000 -0600
++++ dolphin-25.12.3/src/kitemviews/kfileitemmodel.cpp	2026-04-04 22:18:19.096686823 -0500
+@@ -435,6 +435,11 @@
+                 return item->item.time(KFileItem::AccessTime);
+             });
+             break;
++        case ProvenanceTimeRole:
++            m_groups = timeRoleGroups([](const ItemData *item) {
++                return item->item.time(KFileItem::ProvenanceTime);
++            });
++            break;
+         case DeletionTimeRole:
+             m_groups = timeRoleGroups([](const ItemData *item) {
+                 return item->values.value("deletiontime").toDateTime();
+@@ -1928,6 +1933,11 @@
+         data.insert(sharedValue("accesstime"), dateTime);
+     }
+ 
++    if (m_requestRole[ProvenanceTimeRole]) {
++        const long long dateTime = item.entry().numberValue(KIO::UDSEntry::UDS_PROVENANCE_TIME, -1);
++        data.insert(sharedValue("provenancetime"), dateTime);
++    }
++
+     if (m_requestRole[PermissionsRole]) {
+         data.insert(sharedValue("permissions"), QVariantList() << item.permissionsString() << item.permissions());
+     }
+@@ -2183,6 +2193,17 @@
+         break;
+     }
+ 
++    case ProvenanceTimeRole: {
++        const long long dateTimeA = itemA.entry().numberValue(KIO::UDSEntry::UDS_PROVENANCE_TIME, -1);
++        const long long dateTimeB = itemB.entry().numberValue(KIO::UDSEntry::UDS_PROVENANCE_TIME, -1);
++        if (dateTimeA < dateTimeB) {
++            return -1;
++        } else if (dateTimeA > dateTimeB) {
++            return +1;
++        }
++        break;
++    }
++
+     case DeletionTimeRole: {
+         const QDateTime dateTimeA = a->values.value("deletiontime").toDateTime();
+         const QDateTime dateTimeB = b->values.value("deletiontime").toDateTime();
+@@ -2775,6 +2796,7 @@
+         { "modificationtime",    ModificationTimeRole,    kli18nc("@label", "Modified"),             KLazyLocalizedString(),        kli18nc("@tooltip", "The date format can be selected in settings."),                    false,           false },
+         { "creationtime",        CreationTimeRole,        kli18nc("@label", "Created"),              KLazyLocalizedString(),        kli18nc("@tooltip", "The date format can be selected in settings."),                    false,           false },
+         { "accesstime",          AccessTimeRole,          kli18nc("@label", "Accessed"),             KLazyLocalizedString(),        kli18nc("@tooltip", "The date format can be selected in settings."),                    false,           false },
++        { "provenancetime",      ProvenanceTimeRole,      kli18nc("@label", "Provenance Time"),      KLazyLocalizedString(),        kli18nc("@tooltip", "Original creation date preserved across copies. The date format can be selected in settings."),  false,           false },
+         { "type",                TypeRole,                kli18nc("@label", "Type"),                 KLazyLocalizedString(),        KLazyLocalizedString(),                    false,           false },
+         { "rating",              RatingRole,              kli18nc("@label", "Rating"),               KLazyLocalizedString(),        KLazyLocalizedString(),                    true,            false },
+         { "tags",                TagsRole,                kli18nc("@label", "Tags"),                 KLazyLocalizedString(),        KLazyLocalizedString(),                    true,            false },
+--- /tmp/ptime-diff/dolphin-25.12.3/src/kitemviews/kfileitemmodel.h	2026-03-01 20:46:12.000000000 -0600
++++ dolphin-25.12.3/src/kitemviews/kfileitemmodel.h	2026-04-04 22:18:19.095125757 -0500
+@@ -315,6 +315,7 @@
+         ModificationTimeRole,
+         CreationTimeRole,
+         AccessTimeRole,
++        ProvenanceTimeRole,
+         PermissionsRole,
+         OwnerRole,
+         GroupRole,
